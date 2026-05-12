@@ -1,0 +1,958 @@
+from __future__ import annotations
+
+import csv
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import platform
+import random
+import time
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+try:
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None
+
+from .data_loading import build_dataloaders, compute_class_weights, prepare_data_bundle
+from .evaluation_artifacts import (
+    compute_metrics,
+    ensure_run_layout,
+    save_classification_report_text,
+    save_confusion,
+    save_embedding_and_advanced_outputs,
+    save_grad_saliency_panels,
+    save_patch_occlusion_and_faithfulness,
+    save_predictions,
+    save_sample_panels,
+    save_standard_plots,
+    save_csv,
+)
+from .experiment_registry import (
+    MODEL_FAMILIES,
+    ExperimentSpec,
+    build_experiments,
+    get_experiment,
+)
+from .multibranch_model import FiveBranchExperimentModel, build_timm_backbone, resolve_timm_model_name
+from .progress_tracker import CSVProgressTracker, atomic_write_json, atomic_write_text, ensure_dir
+from .tfidf_text import settings_from_config
+
+
+PROGRESS_FIELDS = (
+    "key",
+    "model",
+    "experiment",
+    "fusion",
+    "status",
+    "started_at",
+    "completed_at",
+    "seconds",
+    "run_dir",
+    "message",
+)
+
+
+REQUIRED_COMPLETION_ARTIFACTS = (
+    "checkpoints/best.pt",
+    "checkpoints/last.pt",
+    "logs/history.csv",
+    "metrics/metrics.json",
+    "predictions/predictions.csv",
+    "confusion/confusion_matrix_raw.csv",
+    "confusion/confusion_matrix_normalized.png",
+    "gradcam_saliency/gradcam_saliency_manifest.csv",
+    "gradcam_heatmap/gradcam_heatmap_manifest.csv",
+    "true_vs_pred/true_vs_pred_image_manifest.csv",
+    "metadata/run_summary.json",
+)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_update(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "data": {
+        "dataset_root": "Dataset_classes",
+        "defined_folder": "1 Defined",
+        "asset_root": "Generated_Branches",
+        "image_size": 224,
+    },
+    "training": {
+        "seed": 42,
+        "deterministic": True,
+        "device": "auto",
+        "epochs": 25,
+        "batch_size": 64,
+        "num_workers": 4,
+        "pin_memory": True,
+        "persistent_workers": True,
+        "prefetch_factor": 2,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.0001,
+        "mixed_precision": True,
+        "gradient_accumulation_steps": 1,
+        "early_stopping_patience": 8,
+        "monitor_metric": "val_loss",
+        "checkpoint_metric": "val_loss",
+        "class_weights": {
+            "enabled": True,
+            "boosts": {"fully": 1.25, "one track partly": 2.0},
+        },
+    },
+    "pretrained": {
+        "requested": True,
+        "allow_random_init_if_missing": False,
+        "allow_remote_download": False,
+        "train_random_init_if_pretrained_fails": True,
+        "fallback_random_epochs": 35,
+    },
+    "tfidf": {
+        "max_features": 2048,
+        "ngram_min": 1,
+        "ngram_max": 2,
+        "min_df": 1,
+        "stop_words": "english",
+        "use_svd": False,
+        "svd_components": 256,
+    },
+    "fusion": {
+        "mode": "gated",
+        "hidden_dim": 512,
+        "aux_hidden_dim": 256,
+        "dropout": 0.2,
+        "auxiliary_loss_weight": 0.05,
+        "separate_branch_backbones": False,
+    },
+    "evaluation": {"top_k_samples": 20},
+    "explainability": {
+        "splits": ["val"],
+        "comparison_samples_per_class": 2,
+        "save_gradcam_all_validation": True,
+        "gradcam_saliency_layout": "gradcam_saliency/<TrueClass>/<original_image_stem>.png",
+        "gradcam_heatmap_layout": "gradcam_heatmap/<TrueClass>/<original_image_stem>.png",
+    },
+    "advanced_analysis": {
+        "enable_embedding_analysis": True,
+        "enable_cka": True,
+        "enable_cca": True,
+        "enable_transformer_attribution": True,
+        "enable_tcav": True,
+        "enable_retrieval_boards": True,
+        "enable_selective_classification": True,
+        "enable_conformal": True,
+        "enable_trust_score": True,
+        "enable_faithfulness_tests": True,
+        "enable_data_cartography": True,
+        "enable_data_attribution": True,
+        "enable_regional_shap": False,
+    },
+}
+
+
+def load_config(path: Path | None) -> dict[str, Any]:
+    config = dict(DEFAULT_CONFIG)
+    if path is not None:
+        if yaml is None:
+            raise RuntimeError("PyYAML is required to load YAML configs")
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+        config = deep_update(config, loaded)
+    return config
+
+
+def set_deterministic(seed: int, deterministic: bool) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+
+
+def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(requested)
+
+
+def is_complete(run_dir: Path) -> bool:
+    for rel in REQUIRED_COMPLETION_ARTIFACTS:
+        path = run_dir / rel
+        if not path.exists() or path.stat().st_size <= 0:
+            return False
+    try:
+        summary = json.loads((run_dir / "metadata" / "run_summary.json").read_text(encoding="utf-8"))
+        return summary.get("status") == "complete"
+    except Exception:
+        return False
+
+
+@dataclass
+class RunnerArgs:
+    output_root: Path
+    config_path: Path | None = None
+    model: str | None = None
+    experiment: str | None = None
+    fusion: str | None = None
+    resume: bool = True
+    skip_completed: bool = True
+    include_original_only: bool = False
+    dry_run: bool = False
+    dataset_root: Path | None = None
+    asset_root: Path | None = None
+    defined_folder: str | None = None
+    device: str | None = None
+    batch_size: int | None = None
+    epochs: int | None = None
+    num_workers: int | None = None
+    max_train_samples: int | None = None
+    max_val_samples: int | None = None
+
+
+class ExperimentRunner:
+    def __init__(self, args: RunnerArgs) -> None:
+        self.args = args
+        self.config = load_config(args.config_path)
+        self._apply_cli_overrides()
+        self.output_root = ensure_dir(args.output_root)
+        self.global_root = ensure_dir(self.output_root / "_global_comparison_per_combination")
+        self.global_metadata = ensure_dir(self.global_root / "metadata")
+        self.progress = CSVProgressTracker(self.global_metadata / "progress_runs.csv", PROGRESS_FIELDS)
+        training = self.config["training"]
+        set_deterministic(int(training["seed"]), bool(training.get("deterministic", True)))
+        self.device = resolve_device(str(training.get("device", "auto")))
+        self.capability_manifest: dict[str, Any] = {}
+
+    def _apply_cli_overrides(self) -> None:
+        if self.args.dataset_root is not None:
+            self.config["data"]["dataset_root"] = str(self.args.dataset_root)
+        if self.args.asset_root is not None:
+            self.config["data"]["asset_root"] = str(self.args.asset_root)
+        if self.args.defined_folder is not None:
+            self.config["data"]["defined_folder"] = self.args.defined_folder
+        if self.args.device is not None:
+            self.config["training"]["device"] = self.args.device
+        if self.args.batch_size is not None:
+            self.config["training"]["batch_size"] = self.args.batch_size
+        if self.args.epochs is not None:
+            self.config["training"]["epochs"] = self.args.epochs
+        if self.args.num_workers is not None:
+            self.config["training"]["num_workers"] = self.args.num_workers
+        if self.args.fusion is not None:
+            self.config["fusion"]["mode"] = self.args.fusion
+
+    def selected_models(self) -> list[str]:
+        if self.args.model:
+            if self.args.model not in MODEL_FAMILIES:
+                raise KeyError(f"Unknown model family '{self.args.model}'. Valid: {', '.join(MODEL_FAMILIES)}")
+            return [self.args.model]
+        return list(MODEL_FAMILIES)
+
+    def selected_experiments(self) -> list[ExperimentSpec]:
+        if self.args.experiment:
+            return [get_experiment(self.args.experiment, include_original_only=True)]
+        return build_experiments(include_original_only=self.args.include_original_only)
+
+    def write_experiment_manifest(self, experiments: list[ExperimentSpec]) -> None:
+        atomic_write_json(
+            self.global_metadata / "experiment_manifest.json",
+            {
+                "experiments": [
+                    {
+                        "name": spec.name,
+                        "branches": list(spec.branches),
+                        "visual_branches": list(spec.visual_branches),
+                        "uses_auxiliary_text": spec.uses_aux_text,
+                    }
+                    for spec in experiments
+                ],
+                "default_excludes_original_only": not self.args.include_original_only,
+                "created_at": utc_now(),
+            },
+        )
+
+    def probe_model(self, model_name: str) -> dict[str, Any]:
+        if model_name in self.capability_manifest:
+            return self.capability_manifest[model_name]
+        pretrained = self.config["pretrained"]
+        build = build_timm_backbone(
+            model_name,
+            pretrained_requested=bool(pretrained.get("requested", True)),
+            allow_random_fallback=bool(pretrained.get("train_random_init_if_pretrained_fails", True)),
+            allow_remote_download=bool(pretrained.get("allow_remote_download", False)),
+        )
+        # Do not keep the probe model in memory.
+        if build.model is not None:
+            del build.model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        info = {
+            "model_family": model_name,
+            "timm_model_name": build.timm_model_name or resolve_timm_model_name(model_name),
+            "status": build.status,
+            "available": build.status.startswith("available"),
+            "pretrained": build.pretrained,
+            "visual_dim": build.visual_dim,
+            "error": build.error,
+        }
+        self.capability_manifest[model_name] = info
+        atomic_write_json(self.global_metadata / "model_capability_manifest.json", self.capability_manifest)
+        return info
+
+    def run(self) -> None:
+        models = self.selected_models()
+        experiments = self.selected_experiments()
+        self.write_experiment_manifest(experiments)
+        if self.args.dry_run:
+            self._write_dry_run(models, experiments)
+            return
+        for model_name in models:
+            capability = self.probe_model(model_name)
+            if not capability.get("available"):
+                self._record_model_skip(model_name, experiments, capability)
+                continue
+            for experiment in experiments:
+                self.run_one(model_name, experiment)
+            self.write_model_comparison(model_name)
+        self.write_global_comparisons(experiments)
+        atomic_write_json(self.global_metadata / "model_capability_manifest.json", self.capability_manifest)
+
+    def _write_dry_run(self, models: list[str], experiments: list[ExperimentSpec]) -> None:
+        rows = []
+        for model_name in models:
+            capability = self.probe_model(model_name)
+            for experiment in experiments:
+                rows.append(
+                    {
+                        "model": model_name,
+                        "experiment": experiment.name,
+                        "branches": " + ".join(experiment.branches),
+                        "fusion": self.config["fusion"]["mode"],
+                        "model_available": capability.get("available"),
+                        "timm_model_name": capability.get("timm_model_name"),
+                    }
+                )
+        save_csv(self.global_metadata / "dry_run_plan.csv", rows)
+
+    def _record_model_skip(self, model_name: str, experiments: list[ExperimentSpec], capability: dict[str, Any]) -> None:
+        for experiment in experiments:
+            self.progress.append(
+                {
+                    "key": f"{model_name}/{experiment.name}/{self.config['fusion']['mode']}",
+                    "model": model_name,
+                    "experiment": experiment.name,
+                    "fusion": self.config["fusion"]["mode"],
+                    "status": "skipped_model_unavailable",
+                    "started_at": utc_now(),
+                    "completed_at": utc_now(),
+                    "seconds": 0,
+                    "run_dir": "",
+                    "message": capability.get("error", "model unavailable"),
+                }
+            )
+
+    def run_one(self, model_name: str, experiment: ExperimentSpec) -> None:
+        fusion_mode = str(self.config["fusion"].get("mode", "gated"))
+        run_dir = self.output_root / model_name / experiment.name
+        ensure_run_layout(run_dir)
+        key = f"{model_name}/{experiment.name}/{fusion_mode}"
+        if self.args.skip_completed and is_complete(run_dir):
+            self.progress.append(
+                {
+                    "key": key,
+                    "model": model_name,
+                    "experiment": experiment.name,
+                    "fusion": fusion_mode,
+                    "status": "skipped_complete",
+                    "started_at": utc_now(),
+                    "completed_at": utc_now(),
+                    "seconds": 0,
+                    "run_dir": str(run_dir),
+                    "message": "completion artifacts present",
+                }
+            )
+            return
+
+        started = utc_now()
+        start_time = time.perf_counter()
+        self.progress.append(
+            {
+                "key": key,
+                "model": model_name,
+                "experiment": experiment.name,
+                "fusion": fusion_mode,
+                "status": "started",
+                "started_at": started,
+                "completed_at": "",
+                "seconds": "",
+                "run_dir": str(run_dir),
+                "message": "",
+            }
+        )
+        try:
+            summary = self._train_and_evaluate(model_name, experiment, run_dir)
+        except Exception as exc:  # noqa: BLE001
+            atomic_write_json(
+                run_dir / "metadata" / "run_summary.json",
+                {
+                    "status": "failed",
+                    "model": model_name,
+                    "experiment": experiment.name,
+                    "fusion": fusion_mode,
+                    "error": str(exc),
+                    "started_at": started,
+                    "completed_at": utc_now(),
+                },
+            )
+            self.progress.append(
+                {
+                    "key": key,
+                    "model": model_name,
+                    "experiment": experiment.name,
+                    "fusion": fusion_mode,
+                    "status": "failed",
+                    "started_at": started,
+                    "completed_at": utc_now(),
+                    "seconds": f"{time.perf_counter() - start_time:.2f}",
+                    "run_dir": str(run_dir),
+                    "message": str(exc),
+                }
+            )
+            return
+
+        self.progress.append(
+            {
+                "key": key,
+                "model": model_name,
+                "experiment": experiment.name,
+                "fusion": fusion_mode,
+                "status": "complete",
+                "started_at": started,
+                "completed_at": utc_now(),
+                "seconds": f"{time.perf_counter() - start_time:.2f}",
+                "run_dir": str(run_dir),
+                "message": f"best_epoch={summary.get('best_epoch')}",
+            }
+        )
+
+    def _train_and_evaluate(self, model_name: str, experiment: ExperimentSpec, run_dir: Path) -> dict[str, Any]:
+        data_cfg = self.config["data"]
+        train_cfg = self.config["training"]
+        fusion_cfg = self.config["fusion"]
+        pretrained_cfg = self.config["pretrained"]
+        dataset_root = Path(data_cfg["dataset_root"])
+        asset_root = Path(data_cfg["asset_root"])
+        defined_folder = str(data_cfg.get("defined_folder", "1 Defined"))
+        metadata_dir = run_dir / "metadata"
+        tfidf_settings = settings_from_config(self.config)
+        bundle = prepare_data_bundle(
+            dataset_root=dataset_root,
+            asset_root=asset_root,
+            defined_folder=defined_folder,
+            experiment=experiment,
+            tfidf_settings=tfidf_settings,
+            metadata_dir=metadata_dir,
+            max_train_samples=self.args.max_train_samples,
+            max_val_samples=self.args.max_val_samples,
+            seed=int(train_cfg.get("seed", 42)),
+        )
+        class_names = [bundle.index_to_class[idx] for idx in sorted(bundle.index_to_class)]
+        train_loader, val_loader = build_dataloaders(
+            bundle=bundle,
+            dataset_root=dataset_root,
+            asset_root=asset_root,
+            defined_folder=defined_folder,
+            experiment=experiment,
+            image_size=int(data_cfg.get("image_size", 224)),
+            batch_size=int(train_cfg.get("batch_size", 32)),
+            num_workers=int(train_cfg.get("num_workers", 4)),
+            pin_memory=bool(train_cfg.get("pin_memory", True)),
+            persistent_workers=bool(train_cfg.get("persistent_workers", True)),
+            prefetch_factor=int(train_cfg.get("prefetch_factor", 2)),
+        )
+        model = FiveBranchExperimentModel(
+            backbone_family=model_name,
+            experiment=experiment,
+            num_classes=len(class_names),
+            hidden_dim=int(fusion_cfg.get("hidden_dim", 512)),
+            fusion_mode=str(fusion_cfg.get("mode", "gated")),
+            dropout=float(fusion_cfg.get("dropout", 0.2)),
+            aux_feature_dim=bundle.aux_feature_dim,
+            aux_hidden_dim=int(fusion_cfg.get("aux_hidden_dim", 256)),
+            separate_branch_backbones=bool(fusion_cfg.get("separate_branch_backbones", False)),
+            pretrained_requested=bool(pretrained_cfg.get("requested", True)),
+            allow_random_fallback=bool(pretrained_cfg.get("train_random_init_if_pretrained_fails", True)),
+            allow_remote_download=bool(pretrained_cfg.get("allow_remote_download", False)),
+        ).to(self.device)
+        self.capability_manifest[model_name] = {
+            **self.capability_manifest.get(model_name, {}),
+            **model.metadata(),
+            "available": True,
+        }
+        atomic_write_json(self.global_metadata / "model_capability_manifest.json", self.capability_manifest)
+
+        boosts = train_cfg.get("class_weights", {}).get("boosts", {}) if train_cfg.get("class_weights", {}).get("enabled", True) else {}
+        weights = compute_class_weights(bundle.train_records, bundle.index_to_class, boosts).to(self.device)
+        criterion = nn.CrossEntropyLoss(weight=weights, reduction="none")
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(train_cfg.get("learning_rate", 3e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
+        )
+        epochs = int(train_cfg.get("epochs", 25))
+        if (
+            self.args.epochs is None
+            and not model.backbone_build.pretrained
+            and bool(pretrained_cfg.get("train_random_init_if_pretrained_fails", True))
+        ):
+            epochs = max(epochs, int(pretrained_cfg.get("fallback_random_epochs", epochs)))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+        scaler = torch.cuda.amp.GradScaler(enabled=bool(train_cfg.get("mixed_precision", True)) and self.device.type == "cuda")
+        grad_accum = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
+        aux_weight = float(fusion_cfg.get("auxiliary_loss_weight", 0.05)) if experiment.uses_aux_text else 0.0
+
+        history: list[dict[str, Any]] = []
+        cartography_rows: list[dict[str, Any]] = []
+        best_metric = float("inf")
+        best_epoch = 0
+        patience = int(train_cfg.get("early_stopping_patience", 8))
+        stale = 0
+        for epoch in range(1, epochs + 1):
+            train_stats, train_cart = self._train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                scaler,
+                grad_accum,
+                aux_weight,
+                epoch,
+            )
+            cartography_rows.extend(train_cart)
+            val_stats, _, _, _, _ = self._evaluate(model, val_loader, criterion, aux_weight, collect_embeddings=False)
+            scheduler.step()
+            row = {"epoch": epoch, **train_stats, **{f"val_{k}": v for k, v in val_stats.items()}}
+            history.append(row)
+            save_csv(run_dir / "logs" / "history.csv", history)
+            torch.save(
+                {"model": model.state_dict(), "epoch": epoch, "config": self.config, "metadata": model.metadata()},
+                run_dir / "checkpoints" / "last.pt",
+            )
+            monitor_value = float(val_stats["loss"])
+            if monitor_value < best_metric:
+                best_metric = monitor_value
+                best_epoch = epoch
+                stale = 0
+                torch.save(
+                    {"model": model.state_dict(), "epoch": epoch, "config": self.config, "metadata": model.metadata()},
+                    run_dir / "checkpoints" / "best.pt",
+                )
+            else:
+                stale += 1
+                if stale >= patience:
+                    break
+
+        if (run_dir / "checkpoints" / "best.pt").exists():
+            checkpoint = torch.load(run_dir / "checkpoints" / "best.pt", map_location=self.device)
+            model.load_state_dict(checkpoint["model"])
+
+        val_stats, y_true, probs, losses, payload = self._evaluate(model, val_loader, criterion, aux_weight, collect_embeddings=True)
+        prediction_rows = save_predictions(run_dir, payload["sample_ids"], payload["image_paths"], y_true, probs, losses, class_names)
+        metrics, calibration_rows = compute_metrics(y_true, probs, class_names)
+        metrics.update({"val_loss": float(val_stats["loss"]), "best_epoch": best_epoch})
+        atomic_write_json(run_dir / "metrics" / "metrics.json", metrics)
+        save_csv(run_dir / "metrics" / "metrics.csv", [flatten_metrics(metrics)])
+        save_csv(run_dir / "metrics" / "calibration_table.csv", calibration_rows)
+        save_classification_report_text(run_dir, metrics)
+        save_confusion(run_dir, y_true, probs, class_names)
+        save_standard_plots(run_dir, y_true, probs, class_names, calibration_rows)
+        save_sample_panels(run_dir, prediction_rows, int(self.config.get("evaluation", {}).get("top_k_samples", 20)))
+        save_grad_saliency_panels(
+            model,
+            val_loader,
+            run_dir,
+            class_names,
+            self.device,
+            max_per_class=int(self.config.get("explainability", {}).get("comparison_samples_per_class", 2)),
+        )
+        if self.config.get("advanced_analysis", {}).get("enable_embedding_analysis", True):
+            save_embedding_and_advanced_outputs(run_dir, payload, class_names, experiment.uses_aux_text)
+        if self.config.get("advanced_analysis", {}).get("enable_transformer_attribution", True) or self.config.get("advanced_analysis", {}).get("enable_faithfulness_tests", True):
+            save_patch_occlusion_and_faithfulness(
+                model,
+                val_loader,
+                run_dir,
+                class_names,
+                self.device,
+                max_samples=3,
+                grid_size=4,
+            )
+        if cartography_rows and self.config.get("advanced_analysis", {}).get("enable_data_cartography", True):
+            self._write_cartography(run_dir, cartography_rows)
+        self._write_auxiliary_diagnostics(run_dir, payload, y_true, probs, experiment.uses_aux_text, model, val_loader, bundle)
+        self._write_metadata(run_dir, model, experiment, bundle, class_names, best_epoch, metrics)
+        return {"best_epoch": best_epoch, "metrics": metrics}
+
+    def _train_epoch(
+        self,
+        model: FiveBranchExperimentModel,
+        loader: Any,
+        optimizer: torch.optim.Optimizer,
+        criterion: nn.Module,
+        scaler: torch.cuda.amp.GradScaler,
+        grad_accum: int,
+        aux_weight: float,
+        epoch: int,
+    ) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        model.train()
+        total_loss = 0.0
+        total_ce = 0.0
+        total_aux = 0.0
+        total = 0
+        correct = 0
+        cartography_rows: list[dict[str, Any]] = []
+        optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(loader, start=1):
+            images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
+            labels = batch["labels"].to(self.device, non_blocking=True)
+            aux = batch["aux_features"].to(self.device, non_blocking=True)
+            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                features = model.extract_analysis_features(images, aux)
+                logits = features["logits"]
+                ce = criterion(logits, labels).mean()
+                aux_loss = model.auxiliary_alignment_loss(features) if aux_weight > 0 else logits.new_tensor(0.0)
+                loss = ce + aux_weight * aux_loss
+                scaled_loss = loss / grad_accum
+            scaler.scale(scaled_loss).backward()
+            if step % grad_accum == 0 or step == len(loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                probs = torch.softmax(logits, dim=1)
+                preds = probs.argmax(dim=1)
+                correct += int((preds == labels).sum().item())
+                batch_size = int(labels.shape[0])
+                total += batch_size
+                total_loss += float(loss.detach().item()) * batch_size
+                total_ce += float(ce.detach().item()) * batch_size
+                total_aux += float(aux_loss.detach().item()) * batch_size
+                true_probs = probs.gather(1, labels.view(-1, 1)).squeeze(1).detach().cpu().numpy()
+                pred_np = preds.detach().cpu().numpy()
+                labels_np = labels.detach().cpu().numpy()
+                for i, sample_id in enumerate(batch["sample_ids"]):
+                    cartography_rows.append(
+                        {
+                            "epoch": epoch,
+                            "sample_id": sample_id,
+                            "true_index": int(labels_np[i]),
+                            "pred_index": int(pred_np[i]),
+                            "true_probability": float(true_probs[i]),
+                            "correct": bool(pred_np[i] == labels_np[i]),
+                        }
+                    )
+        denom = max(1, total)
+        return (
+            {
+                "train_loss": total_loss / denom,
+                "train_ce_loss": total_ce / denom,
+                "train_aux_loss": total_aux / denom,
+                "train_accuracy": correct / denom,
+            },
+            cartography_rows,
+        )
+
+    def _evaluate(
+        self,
+        model: FiveBranchExperimentModel,
+        loader: Any,
+        criterion: nn.Module,
+        aux_weight: float,
+        collect_embeddings: bool,
+    ) -> tuple[dict[str, float], np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+        model.eval()
+        total_loss = 0.0
+        total_ce = 0.0
+        total_aux = 0.0
+        total = 0
+        labels_all: list[np.ndarray] = []
+        probs_all: list[np.ndarray] = []
+        losses_all: list[np.ndarray] = []
+        payload: dict[str, Any] = {"sample_ids": [], "image_paths": []}
+        embedding_store: dict[str, list[np.ndarray]] = {}
+        with torch.no_grad():
+            for batch in loader:
+                images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
+                labels = batch["labels"].to(self.device, non_blocking=True)
+                aux = batch["aux_features"].to(self.device, non_blocking=True)
+                features = model.extract_analysis_features(images, aux)
+                logits = features["logits"]
+                ce_each = criterion(logits, labels)
+                ce = ce_each.mean()
+                aux_loss = model.auxiliary_alignment_loss(features) if aux_weight > 0 else logits.new_tensor(0.0)
+                loss = ce + aux_weight * aux_loss
+                probs = torch.softmax(logits, dim=1)
+                batch_size = int(labels.shape[0])
+                total += batch_size
+                total_loss += float(loss.item()) * batch_size
+                total_ce += float(ce.item()) * batch_size
+                total_aux += float(aux_loss.item()) * batch_size
+                labels_all.append(labels.cpu().numpy())
+                probs_all.append(probs.cpu().numpy())
+                losses_all.append(ce_each.detach().cpu().numpy())
+                payload["sample_ids"].extend(batch["sample_ids"])
+                payload["image_paths"].extend(batch["image_paths"])
+                if collect_embeddings:
+                    for key, value in features.items():
+                        if isinstance(value, torch.Tensor) and (
+                            key.endswith("_embedding") or key.endswith("_projected_embedding") or key in {"fused_visual_embedding", "probabilities", "aux_input"}
+                        ):
+                            embedding_store.setdefault(key, []).append(value.detach().cpu().numpy())
+        labels_np = np.concatenate(labels_all) if labels_all else np.zeros(0, dtype=int)
+        probs_np = np.concatenate(probs_all) if probs_all else np.zeros((0, 0), dtype=np.float32)
+        losses_np = np.concatenate(losses_all) if losses_all else np.zeros(0, dtype=np.float32)
+        for key, chunks in embedding_store.items():
+            payload[key] = np.concatenate(chunks, axis=0)
+        payload["labels"] = labels_np
+        payload["probabilities"] = probs_np
+        denom = max(1, total)
+        stats = {"loss": total_loss / denom, "ce_loss": total_ce / denom, "aux_loss": total_aux / denom}
+        return stats, labels_np, probs_np, losses_np, payload
+
+    def _write_cartography(self, run_dir: Path, rows: list[dict[str, Any]]) -> None:
+        save_csv(run_dir / "cartography" / "training_dynamics.csv", rows)
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["sample_id"]), []).append(row)
+        summary = []
+        for sample_id, sample_rows in grouped.items():
+            summary.append(
+                {
+                    "sample_id": sample_id,
+                    "mean_true_probability": float(np.mean([r["true_probability"] for r in sample_rows])),
+                    "correctness": float(np.mean([1.0 if r["correct"] else 0.0 for r in sample_rows])),
+                    "variability": float(np.std([r["true_probability"] for r in sample_rows])),
+                }
+            )
+        save_csv(run_dir / "cartography" / "cartography_summary.csv", summary)
+
+    def _write_auxiliary_diagnostics(
+        self,
+        run_dir: Path,
+        payload: dict[str, Any],
+        y_true: np.ndarray,
+        probs: np.ndarray,
+        aux_active: bool,
+        model: FiveBranchExperimentModel,
+        val_loader: Any,
+        bundle: Any,
+    ) -> None:
+        if not aux_active or "aux_embedding" not in payload:
+            atomic_write_json(run_dir / "metadata" / "auxiliary_diagnostics.json", {"active": False})
+            return
+        visual = torch.tensor(payload["fused_visual_embedding"])
+        aux = torch.tensor(payload["aux_embedding"])
+        cosine = F.cosine_similarity(F.normalize(visual, dim=1), F.normalize(aux, dim=1), dim=1).numpy()
+        pred = probs.argmax(axis=1)
+        rows = []
+        for idx, sample_id in enumerate(payload["sample_ids"]):
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "true_index": int(y_true[idx]),
+                    "pred_index": int(pred[idx]),
+                    "correct": bool(pred[idx] == y_true[idx]),
+                    "image_aux_cosine": float(cosine[idx]),
+                }
+            )
+        save_csv(run_dir / "metadata" / "image_aux_cosine_by_sample.csv", rows)
+        zero_probs = self._eval_probs_with_aux_override(model, val_loader, mode="zero")
+        shuffle_probs = self._eval_probs_with_aux_override(model, val_loader, mode="shuffle")
+        zero_delta = float(np.max(np.abs(probs - zero_probs))) if zero_probs.shape == probs.shape else None
+        shuffle_delta = float(np.max(np.abs(probs - shuffle_probs))) if shuffle_probs.shape == probs.shape else None
+        text_probe = self._text_only_probe(bundle)
+        atomic_write_json(
+            run_dir / "metadata" / "auxiliary_diagnostics.json",
+            {
+                "active": True,
+                "mean_cosine": float(np.mean(cosine)),
+                "correct_mean_cosine": float(np.mean(cosine[pred == y_true])) if np.any(pred == y_true) else None,
+                "incorrect_mean_cosine": float(np.mean(cosine[pred != y_true])) if np.any(pred != y_true) else None,
+                "zero_aux_max_probability_delta": zero_delta,
+                "shuffle_aux_max_probability_delta": shuffle_delta,
+                "text_only_probe": text_probe,
+                "leakage_rule": "TF-IDF class descriptions are label-derived; final logits are computed from fused visual embeddings only.",
+            },
+        )
+
+    def _eval_probs_with_aux_override(self, model: FiveBranchExperimentModel, loader: Any, mode: str) -> np.ndarray:
+        model.eval()
+        chunks: list[np.ndarray] = []
+        with torch.no_grad():
+            for batch in loader:
+                images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
+                aux = batch["aux_features"].to(self.device, non_blocking=True)
+                if mode == "zero":
+                    aux = torch.zeros_like(aux)
+                elif mode == "shuffle" and aux.shape[0] > 1:
+                    aux = aux[torch.randperm(aux.shape[0], device=aux.device)]
+                logits = model(images, aux)
+                chunks.append(torch.softmax(logits, dim=1).detach().cpu().numpy())
+        return np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 0), dtype=np.float32)
+
+    def _text_only_probe(self, bundle: Any) -> dict[str, Any]:
+        if bundle.class_description_matrix is None:
+            return {"active": False}
+        train_x = np.stack([bundle.class_description_matrix[record.label] for record in bundle.train_records])
+        train_y = np.array([record.label for record in bundle.train_records])
+        val_x = np.stack([bundle.class_description_matrix[record.label] for record in bundle.val_records])
+        val_y = np.array([record.label for record in bundle.val_records])
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.metrics import accuracy_score
+
+            clf = LogisticRegression(max_iter=1000, multi_class="auto")
+            clf.fit(train_x, train_y)
+            pred = clf.predict(val_x)
+            return {
+                "active": True,
+                "method": "logistic_regression_on_tfidf_only",
+                "val_accuracy": float(accuracy_score(val_y, pred)),
+                "interpretation": "High accuracy demonstrates why direct TF-IDF-to-logit use would leak labels.",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"active": True, "method": "logistic_regression_on_tfidf_only", "error": str(exc)}
+
+    def _write_metadata(
+        self,
+        run_dir: Path,
+        model: FiveBranchExperimentModel,
+        experiment: ExperimentSpec,
+        bundle: Any,
+        class_names: list[str],
+        best_epoch: int,
+        metrics: dict[str, Any],
+    ) -> None:
+        atomic_write_json(run_dir / "metadata" / "config_snapshot.json", self.config)
+        atomic_write_json(
+            run_dir / "metadata" / "environment.json",
+            {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "torch": torch.__version__,
+                "cuda_available": torch.cuda.is_available(),
+                "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+                "cwd": os.getcwd(),
+            },
+        )
+        atomic_write_json(
+            run_dir / "metadata" / "run_summary.json",
+            {
+                "status": "complete",
+                "model": model.backbone_family,
+                "experiment": experiment.name,
+                "branches": list(experiment.branches),
+                "fusion": self.config["fusion"]["mode"],
+                "best_epoch": best_epoch,
+                "class_to_index": bundle.class_to_index,
+                "index_to_class": {str(k): v for k, v in bundle.index_to_class.items()},
+                "class_names": class_names,
+                "model_metadata": model.metadata(),
+                "primary_metrics": {k: v for k, v in metrics.items() if isinstance(v, (int, float, str, bool))},
+                "shap_enabled": False,
+                "completed_at": utc_now(),
+            },
+        )
+
+    def write_model_comparison(self, model_name: str) -> None:
+        comparison_root = ensure_dir(self.output_root / model_name / "_comparison_across_experiments")
+        for subdir in ("tables", "plots", "explainability", "confusion", "gradcam", "metrics", "metadata"):
+            ensure_dir(comparison_root / subdir)
+        rows = []
+        for run_dir in sorted((self.output_root / model_name).iterdir()) if (self.output_root / model_name).exists() else []:
+            if not run_dir.is_dir() or run_dir.name.startswith("_"):
+                continue
+            metrics_path = run_dir / "metrics" / "metrics.json"
+            if not metrics_path.exists():
+                continue
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            row = {"model": model_name, "experiment": run_dir.name}
+            row.update(flatten_metrics(metrics))
+            rows.append(row)
+        if rows:
+            save_csv(comparison_root / "tables" / "metrics_summary.csv", rows)
+            atomic_write_json(comparison_root / "metadata" / "comparison_summary.json", {"runs": len(rows), "model": model_name})
+
+    def write_global_comparisons(self, experiments: list[ExperimentSpec]) -> None:
+        best_by_experiment: dict[str, Any] = {}
+        for experiment in experiments:
+            root = ensure_dir(self.global_root / experiment.name)
+            for subdir in (
+                "data_reports",
+                "explainability",
+                "tables",
+                "plots",
+                "embeddings",
+                "cka",
+                "cca_alignment",
+                "selective_classification",
+                "conformal",
+                "trust_score",
+                "cartography",
+                "metadata",
+            ):
+                ensure_dir(root / subdir)
+            rows = []
+            for model_name in MODEL_FAMILIES:
+                metrics_path = self.output_root / model_name / experiment.name / "metrics" / "metrics.json"
+                if not metrics_path.exists():
+                    continue
+                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+                row = {"model": model_name, "experiment": experiment.name}
+                row.update(flatten_metrics(metrics))
+                rows.append(row)
+            if rows:
+                save_csv(root / "tables" / "metrics_summary.csv", rows)
+                best = max(rows, key=lambda row: float(row.get("macro_f1", row.get("accuracy", 0.0))))
+                best_by_experiment[experiment.name] = best
+                atomic_write_text(
+                    root / "benchmark_summary_extended.md",
+                    f"# {experiment.name}\n\nRuns: {len(rows)}\n\nBest by macro F1: {best.get('model')}\n",
+                )
+                atomic_write_text(
+                    root / "final_benchmark_summary.md",
+                    f"# Final Summary: {experiment.name}\n\nBest model: {best.get('model')}\n",
+                )
+        atomic_write_json(self.global_metadata / "best_model_selection.json", best_by_experiment)
+
+
+def flatten_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+    for key, value in metrics.items():
+        if isinstance(value, (int, float, str, bool)) or value is None:
+            flat[key] = value
+    return flat

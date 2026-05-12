@@ -1,0 +1,46 @@
+branches:
+  original:
+    kind: source_image
+    required_everywhere: true
+  cropped:
+    kind: generated_image
+    asset_dir: Generated_Branches/cropped_local
+    filename_suffix: CROP
+    crop:
+      top_removed: 0.25
+      bottom_removed: 0.30
+      left_removed: 0.10
+      right_removed: 0.10
+  thermal:
+    kind: generated_image
+    asset_dir: Generated_Branches/thermal_clahe_inferno
+    transform: CLAHE_Inferno
+    filename_suffix: THERMAL
+  segmented:
+    kind: generated_image
+    asset_dir: Generated_Branches/segmented_best_combined
+    transform: classical_best_combination_BEST_COMBINED
+    filename_suffix: SEG
+  auxiliary_text:
+    kind: tfidf_class_description
+    safe_logits: image_driven_only
+
+default_experiments:
+  - exp_original_thermal_segmented_cropped_auxtext
+  - exp_original_thermal
+  - exp_original_segmented
+  - exp_original_cropped
+  - exp_original_auxtext
+  - exp_original_thermal_segmented
+  - exp_original_thermal_cropped
+  - exp_original_thermal_auxtext
+  - exp_original_segmented_cropped
+  - exp_original_segmented_auxtext
+  - exp_original_cropped_auxtext
+  - exp_original_thermal_segmented_cropped
+  - exp_original_thermal_segmented_auxtext
+  - exp_original_thermal_cropped_auxtext
+  - exp_original_segmented_cropped_auxtext
+
+optional_experiments:
+  - exp_original_only

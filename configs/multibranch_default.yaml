@@ -1,0 +1,84 @@
+data:
+  dataset_root: Dataset_classes
+  defined_folder: "1 Defined"
+  asset_root: Generated_Branches
+  image_size: 224
+  context_source: fixed_class_descriptions
+
+training:
+  seed: 42
+  deterministic: true
+  device: auto
+  epochs: 25
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  dataloader_timeout: 120
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  mixed_precision: true
+  gradient_accumulation_steps: 1
+  early_stopping_patience: 8
+  monitor_metric: val_loss
+  checkpoint_metric: val_loss
+  progress_update_steps: 5
+  class_weights:
+    enabled: true
+    boosts:
+      fully: 1.25
+      one track partly: 2.0
+
+pretrained:
+  requested: true
+  allow_random_init_if_missing: false
+  weights_dir: weights
+  cache_dir: weights/pretrained_cache
+  allow_remote_download: false
+  verified_epochs: 35
+  train_random_init_if_pretrained_fails: true
+  fallback_random_epochs: 35
+
+tfidf:
+  max_features: 2048
+  ngram_min: 1
+  ngram_max: 2
+  min_df: 1
+  stop_words: english
+  use_svd: false
+  svd_components: 256
+
+fusion:
+  mode: gated
+  hidden_dim: 512
+  aux_hidden_dim: 256
+  dropout: 0.2
+  auxiliary_loss_weight: 0.05
+  separate_branch_backbones: false
+
+evaluation:
+  top_k_samples: 20
+
+explainability:
+  splits: [val]
+  all_mode_comparison_splits: [val]
+  comparison_samples_per_class: 2
+  save_gradcam_all_validation: true
+  gradcam_saliency_layout: "gradcam_saliency/<TrueClass>/<original_image_stem>.png"
+  gradcam_heatmap_layout: "gradcam_heatmap/<TrueClass>/<original_image_stem>.png"
+
+advanced_analysis:
+  enable_embedding_analysis: true
+  enable_cka: true
+  enable_cca: true
+  enable_transformer_attribution: true
+  enable_tcav: true
+  enable_retrieval_boards: true
+  enable_selective_classification: true
+  enable_conformal: true
+  enable_trust_score: true
+  enable_faithfulness_tests: true
+  enable_data_cartography: true
+  enable_data_attribution: true
+  enable_regional_shap: false
