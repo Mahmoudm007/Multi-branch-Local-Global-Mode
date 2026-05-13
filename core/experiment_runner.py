@@ -598,7 +598,7 @@ class ExperimentRunner:
         ):
             epochs = max(epochs, int(pretrained_cfg.get("fallback_random_epochs", epochs)))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
-        scaler = torch.cuda.amp.GradScaler(enabled=bool(train_cfg.get("mixed_precision", True)) and self.device.type == "cuda")
+        scaler = make_grad_scaler(enabled=bool(train_cfg.get("mixed_precision", True)) and self.device.type == "cuda")
         grad_accum = max(1, int(train_cfg.get("gradient_accumulation_steps", 1)))
         aux_weight = float(fusion_cfg.get("auxiliary_loss_weight", 0.05)) if experiment.uses_aux_text else 0.0
 
@@ -740,7 +740,7 @@ class ExperimentRunner:
         loader: Any,
         optimizer: torch.optim.Optimizer,
         criterion: nn.Module,
-        scaler: torch.cuda.amp.GradScaler,
+        scaler: Any,
         grad_accum: int,
         aux_weight: float,
         epoch: int,
@@ -770,7 +770,7 @@ class ExperimentRunner:
             images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
             labels = batch["labels"].to(self.device, non_blocking=True)
             aux = batch["aux_features"].to(self.device, non_blocking=True)
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+            with autocast_context(enabled=scaler.is_enabled(), device_type=self.device.type):
                 features = model.extract_analysis_features(images, aux)
                 logits = features["logits"]
                 ce = criterion(logits, labels).mean()
@@ -1214,6 +1214,27 @@ def flatten_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     return flat
 
 
+def make_grad_scaler(enabled: bool) -> Any:
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=enabled)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def autocast_context(enabled: bool, device_type: str) -> Any:
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device_type if device_type in {"cuda", "cpu"} else "cuda", enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def module_parameter_dtype(module: nn.Module) -> torch.dtype:
+    for parameter in module.parameters(recurse=True):
+        return parameter.dtype
+    return torch.float32
+
+
 ITERATION_METRIC_ORDER = (
     "acc",
     "bal_acc",
@@ -1311,7 +1332,8 @@ def _compute_iteration_arrays(
     original_projected = features.get("original_projected_embedding")
     fused_visual = features.get("fused_visual_embedding")
     if isinstance(original_projected, torch.Tensor):
-        base_logits = model.classifier(original_projected)
+        classifier_input = original_projected.to(dtype=module_parameter_dtype(model.classifier))
+        base_logits = model.classifier(classifier_input)
         base_probs = torch.softmax(base_logits, dim=1)
         base_preds = base_probs.argmax(dim=1)
         arrays["base_visual_correct"] = (base_preds == labels).detach().float().cpu().numpy()
