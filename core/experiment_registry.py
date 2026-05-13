@@ -65,22 +65,23 @@ MODEL_FAMILIES = (
     "davit",
 )
 
-# Ordered from smallest/local-friendly to larger fallbacks. The family name remains
-# the benchmark identity; the chosen timm model is logged in the capability manifest.
+# Ordered to prefer base/large variants over tiny/small variants. The family name
+# remains the benchmark identity; the chosen timm model is logged in the capability
+# manifest.
 TIMM_MODEL_CANDIDATES = {
-    "convnext": ("convnext_tiny", "convnext_small", "convnext_base"),
-    "convnext_v2": ("convnextv2_tiny", "convnextv2_base", "convnextv2_small"),
-    "maxvit": ("maxvit_tiny_rw_224", "maxvit_rmlp_tiny_rw_256", "maxvit_base_tf_224"),
-    "deit_base": ("deit_base_patch16_224", "deit3_base_patch16_224"),
+    "convnext": ("convnext_base", "convnext_large", "convnext_large_mlp", "convnext_xlarge"),
+    "convnext_v2": ("convnextv2_base", "convnextv2_large", "convnextv2_huge"),
+    "maxvit": ("maxvit_base_tf_224", "maxvit_large_tf_224", "maxvit_rmlp_base_rw_224", "maxvit_xlarge_tf_224"),
+    "deit_base": ("deit_base_patch16_224", "deit3_base_patch16_224", "deit3_large_patch16_224"),
     "seresnext50": ("seresnext50_32x4d", "legacy_seresnext50_32x4d"),
     "inception_v3": ("inception_v3", "tf_inception_v3"),
-    "xception": ("xception", "legacy_xception"),
-    "beit_base": ("beit_base_patch16_224", "beitv2_base_patch16_224"),
-    "pvt_v2": ("pvt_v2_b0", "pvt_v2_b1", "pvt_v2_b2"),
-    "mambaout": ("mambaout_femto", "mambaout_kobe", "mambaout_tiny"),
-    "coatnet": ("coatnet_0_rw_224", "coatnet_1_rw_224", "coatnet_bn_0_rw_224"),
-    "focalnet": ("focalnet_tiny_lrf", "focalnet_small_lrf", "focalnet_base_lrf"),
-    "davit": ("davit_tiny", "davit_small", "davit_base"),
+    "xception": ("xception65", "xception71", "xception41", "xception"),
+    "beit_base": ("beit_base_patch16_224", "beitv2_base_patch16_224", "beit_large_patch16_224"),
+    "pvt_v2": ("pvt_v2_b2", "pvt_v2_b3", "pvt_v2_b4", "pvt_v2_b5"),
+    "mambaout": ("mambaout_base", "mambaout_large", "mambaout_kobe"),
+    "coatnet": ("coatnet_2_rw_224", "coatnet_3_rw_224", "coatnet_4_224", "coatnet_5_224", "coatnet_1_rw_224"),
+    "focalnet": ("focalnet_base_lrf", "focalnet_large_fl3", "focalnet_large_fl4", "focalnet_xlarge_fl3"),
+    "davit": ("davit_base", "davit_large", "davit_base_fl", "davit_huge"),
 }
 
 CANONICAL_CLASS_ORDER = (
@@ -124,12 +125,23 @@ def experiment_name(branches: Iterable[str]) -> str:
 
 def build_experiments(include_original_only: bool = False) -> list[ExperimentSpec]:
     experiments: list[ExperimentSpec] = []
-    if include_original_only:
-        experiments.append(ExperimentSpec("exp_original_only", (ORIGINAL,)))
-    for optional_count in (4, 1, 2, 3):
+    priority_optionals = (
+        (THERMAL, SEGMENTED, CROPPED, AUX_TEXT),
+        (THERMAL, CROPPED, AUX_TEXT),
+    )
+    seen: set[tuple[str, ...]] = set()
+    for optional in priority_optionals:
+        branches = (ORIGINAL, *optional)
+        experiments.append(ExperimentSpec(experiment_name(branches), branches))
+        seen.add(optional)
+    for optional_count in (1, 2, 3, 4):
         for optional in combinations(OPTIONAL_BRANCH_ORDER, optional_count):
+            if optional in seen:
+                continue
             branches = (ORIGINAL, *optional)
             experiments.append(ExperimentSpec(experiment_name(branches), branches))
+    if include_original_only:
+        experiments.append(ExperimentSpec("exp_original_only", (ORIGINAL,)))
     return experiments
 
 

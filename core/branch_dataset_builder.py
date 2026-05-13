@@ -517,13 +517,12 @@ class BranchDatasetBuilder:
             raise KeyError(f"Unsupported generated branch: {branch}")
         branch_root = self.branch_defined_root(branch)
         tracker = CSVProgressTracker(self.manifest_dir / f"progress_{branch}.csv", PROGRESS_FIELDS)
-        completed = tracker.completed_keys(self.asset_root) if skip_completed and not overwrite else set()
         stats = {"ok": 0, "skipped": 0, "error": 0, "warnings": 0}
         start_all = time.perf_counter()
         for record in records:
             output_path = output_path_for_record(branch_root, record, branch)
             key = record.sample_id
-            if not overwrite and (key in completed or (skip_completed and validate_image_file(output_path)[0])):
+            if not overwrite and skip_completed and validate_image_file(output_path)[0]:
                 stats["skipped"] += 1
                 continue
             start = time.perf_counter()

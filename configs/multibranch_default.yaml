@@ -4,6 +4,7 @@ data:
   asset_root: Generated_Branches
   image_size: 224
   context_source: fixed_class_descriptions
+  allow_missing_generated_assets: true
 
 training:
   seed: 42
@@ -23,7 +24,9 @@ training:
   early_stopping_patience: 8
   monitor_metric: val_loss
   checkpoint_metric: val_loss
-  progress_update_steps: 5
+  progress_bar: true
+  progress_update_steps: 1
+  stop_on_run_failure: true
   class_weights:
     enabled: true
     boosts:
@@ -82,3 +85,8 @@ advanced_analysis:
   enable_data_cartography: true
   enable_data_attribution: true
   enable_regional_shap: false
+
+experiment_overrides:
+  exp_original_thermal_segmented_cropped_auxtext:
+    epochs: 70
+    early_stopping_patience: 25

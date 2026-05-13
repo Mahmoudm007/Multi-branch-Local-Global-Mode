@@ -8,8 +8,10 @@ import os
 from pathlib import Path
 import platform
 import random
+import sys
 import time
 from typing import Any
+import warnings
 
 import numpy as np
 import torch
@@ -20,6 +22,11 @@ try:
     import yaml
 except Exception:  # pragma: no cover
     yaml = None
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - progress falls back to plain prints
+    tqdm = None
 
 from .data_loading import build_dataloaders, compute_class_weights, prepare_data_bundle
 from .evaluation_artifacts import (
@@ -95,6 +102,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "defined_folder": "1 Defined",
         "asset_root": "Generated_Branches",
         "image_size": 224,
+        "allow_missing_generated_assets": True,
     },
     "training": {
         "seed": 42,
@@ -113,6 +121,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "early_stopping_patience": 8,
         "monitor_metric": "val_loss",
         "checkpoint_metric": "val_loss",
+        "progress_bar": True,
+        "progress_update_steps": 1,
+        "stop_on_run_failure": True,
         "class_weights": {
             "enabled": True,
             "boosts": {"fully": 1.25, "one track partly": 2.0},
@@ -164,6 +175,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enable_data_cartography": True,
         "enable_data_attribution": True,
         "enable_regional_shap": False,
+    },
+    "experiment_overrides": {
+        "exp_original_thermal_segmented_cropped_auxtext": {
+            "epochs": 70,
+            "early_stopping_patience": 25,
+        }
     },
 }
 
@@ -442,6 +459,12 @@ class ExperimentRunner:
                     "message": str(exc),
                 }
             )
+            print(
+                f"[RUN FAILED] model={model_name} experiment={experiment.name} error={exc}",
+                flush=True,
+            )
+            if bool(self.config.get("training", {}).get("stop_on_run_failure", True)):
+                raise
             return
 
         self.progress.append(
@@ -464,6 +487,18 @@ class ExperimentRunner:
         train_cfg = self.config["training"]
         fusion_cfg = self.config["fusion"]
         pretrained_cfg = self.config["pretrained"]
+        experiment_train_cfg = self.config.get("experiment_overrides", {}).get(experiment.name, {})
+        configured_epochs = (
+            int(train_cfg.get("epochs", 25))
+            if self.args.epochs is not None
+            else int(experiment_train_cfg.get("epochs", train_cfg.get("epochs", 25)))
+        )
+        configured_patience = int(
+            experiment_train_cfg.get(
+                "early_stopping_patience",
+                train_cfg.get("early_stopping_patience", 8),
+            )
+        )
         dataset_root = Path(data_cfg["dataset_root"])
         asset_root = Path(data_cfg["asset_root"])
         defined_folder = str(data_cfg.get("defined_folder", "1 Defined"))
@@ -479,7 +514,18 @@ class ExperimentRunner:
             max_train_samples=self.args.max_train_samples,
             max_val_samples=self.args.max_val_samples,
             seed=int(train_cfg.get("seed", 42)),
+            allow_missing_generated_assets=bool(data_cfg.get("allow_missing_generated_assets", True)),
         )
+        excluded_assets = int(bundle.asset_filter_summary.get("excluded_records", 0))
+        if excluded_assets:
+            print(
+                (
+                    f"[DATA FILTER] experiment={experiment.name} excluded_records={excluded_assets} "
+                    f"kept_records={bundle.asset_filter_summary.get('kept_records')} "
+                    f"branch_issue_counts={bundle.asset_filter_summary.get('branch_issue_counts')}"
+                ),
+                flush=True,
+            )
         class_names = [bundle.index_to_class[idx] for idx in sorted(bundle.index_to_class)]
         train_loader, val_loader = build_dataloaders(
             bundle=bundle,
@@ -493,6 +539,15 @@ class ExperimentRunner:
             pin_memory=bool(train_cfg.get("pin_memory", True)),
             persistent_workers=bool(train_cfg.get("persistent_workers", True)),
             prefetch_factor=int(train_cfg.get("prefetch_factor", 2)),
+        )
+        print(
+            (
+                f"\n[RUN] model={model_name} experiment={experiment.name} "
+                f"fusion={fusion_cfg.get('mode', 'gated')} device={self.device} "
+                f"epochs={configured_epochs} early_stop_patience={configured_patience} "
+                f"train_batches={len(train_loader)} val_batches={len(val_loader)}"
+            ),
+            flush=True,
         )
         model = FiveBranchExperimentModel(
             backbone_family=model_name,
@@ -508,9 +563,21 @@ class ExperimentRunner:
             allow_random_fallback=bool(pretrained_cfg.get("train_random_init_if_pretrained_fails", True)),
             allow_remote_download=bool(pretrained_cfg.get("allow_remote_download", False)),
         ).to(self.device)
+        parameter_counts = count_model_parameters(model)
+        print(
+            (
+                f"[MODEL PARAMS] model={model_name} experiment={experiment.name} "
+                f"timm={model.backbone_build.timm_model_name} "
+                f"total={parameter_counts['total']:,} ({parameter_counts['total_millions']:.2f}M) "
+                f"trainable={parameter_counts['trainable']:,} ({parameter_counts['trainable_millions']:.2f}M) "
+                f"frozen={parameter_counts['frozen']:,} ({parameter_counts['frozen_millions']:.2f}M)"
+            ),
+            flush=True,
+        )
         self.capability_manifest[model_name] = {
             **self.capability_manifest.get(model_name, {}),
             **model.metadata(),
+            "parameter_counts": parameter_counts,
             "available": True,
         }
         atomic_write_json(self.global_metadata / "model_capability_manifest.json", self.capability_manifest)
@@ -523,7 +590,7 @@ class ExperimentRunner:
             lr=float(train_cfg.get("learning_rate", 3e-4)),
             weight_decay=float(train_cfg.get("weight_decay", 1e-4)),
         )
-        epochs = int(train_cfg.get("epochs", 25))
+        epochs = configured_epochs
         if (
             self.args.epochs is None
             and not model.backbone_build.pretrained
@@ -539,9 +606,10 @@ class ExperimentRunner:
         cartography_rows: list[dict[str, Any]] = []
         best_metric = float("inf")
         best_epoch = 0
-        patience = int(train_cfg.get("early_stopping_patience", 8))
+        patience = configured_patience
         stale = 0
         for epoch in range(1, epochs + 1):
+            print(f"[EPOCH {epoch}/{epochs}] train start: {model_name}/{experiment.name}", flush=True)
             train_stats, train_cart = self._train_epoch(
                 model,
                 train_loader,
@@ -551,9 +619,20 @@ class ExperimentRunner:
                 grad_accum,
                 aux_weight,
                 epoch,
+                epochs,
+                model_name,
+                experiment.name,
             )
             cartography_rows.extend(train_cart)
-            val_stats, _, _, _, _ = self._evaluate(model, val_loader, criterion, aux_weight, collect_embeddings=False)
+            print(f"[EPOCH {epoch}/{epochs}] val start: {model_name}/{experiment.name}", flush=True)
+            val_stats, _, _, _, _ = self._evaluate(
+                model,
+                val_loader,
+                criterion,
+                aux_weight,
+                collect_embeddings=False,
+                progress_desc=f"{model_name}/{experiment.name} epoch {epoch}/{epochs} val",
+            )
             scheduler.step()
             row = {"epoch": epoch, **train_stats, **{f"val_{k}": v for k, v in val_stats.items()}}
             history.append(row)
@@ -563,6 +642,7 @@ class ExperimentRunner:
                 run_dir / "checkpoints" / "last.pt",
             )
             monitor_value = float(val_stats["loss"])
+            should_stop = False
             if monitor_value < best_metric:
                 best_metric = monitor_value
                 best_epoch = epoch
@@ -574,13 +654,50 @@ class ExperimentRunner:
             else:
                 stale += 1
                 if stale >= patience:
-                    break
+                    should_stop = True
+            print(
+                (
+                    f"[EPOCH {epoch}/{epochs}] done: "
+                    f"train_loss={train_stats['train_loss']:.4f} "
+                    f"train_acc={train_stats['train_accuracy']:.4f} "
+                    f"train_f1={train_stats['train_macro_f1']:.4f} "
+                    f"train_precision={train_stats['train_macro_precision']:.4f} "
+                    f"train_recall={train_stats['train_macro_recall']:.4f} "
+                    f"train_top2={train_stats['train_top2_accuracy']:.4f} "
+                    f"train_top3={train_stats['train_top3_accuracy']:.4f} "
+                    f"val_loss={val_stats['loss']:.4f} "
+                    f"val_acc={val_stats['accuracy']:.4f} "
+                    f"val_f1={val_stats['macro_f1']:.4f} "
+                    f"val_precision={val_stats['macro_precision']:.4f} "
+                    f"val_recall={val_stats['macro_recall']:.4f} "
+                    f"val_bal_acc={val_stats['balanced_accuracy']:.4f} "
+                    f"val_top2={val_stats['top2_accuracy']:.4f} "
+                    f"val_top3={val_stats['top3_accuracy']:.4f} "
+                    f"val_aux={val_stats['aux_loss']:.4f} "
+                    f"best_epoch={best_epoch}"
+                ),
+                flush=True,
+            )
+            if should_stop:
+                print(
+                    f"[EARLY STOP] model={model_name} experiment={experiment.name} epoch={epoch} stale_epochs={stale}",
+                    flush=True,
+                )
+                break
 
         if (run_dir / "checkpoints" / "best.pt").exists():
             checkpoint = torch.load(run_dir / "checkpoints" / "best.pt", map_location=self.device)
             model.load_state_dict(checkpoint["model"])
 
-        val_stats, y_true, probs, losses, payload = self._evaluate(model, val_loader, criterion, aux_weight, collect_embeddings=True)
+        print(f"[FINAL EVAL] model={model_name} experiment={experiment.name}", flush=True)
+        val_stats, y_true, probs, losses, payload = self._evaluate(
+            model,
+            val_loader,
+            criterion,
+            aux_weight,
+            collect_embeddings=True,
+            progress_desc=f"{model_name}/{experiment.name} final val",
+        )
         prediction_rows = save_predictions(run_dir, payload["sample_ids"], payload["image_paths"], y_true, probs, losses, class_names)
         metrics, calibration_rows = compute_metrics(y_true, probs, class_names)
         metrics.update({"val_loss": float(val_stats["loss"]), "best_epoch": best_epoch})
@@ -627,6 +744,9 @@ class ExperimentRunner:
         grad_accum: int,
         aux_weight: float,
         epoch: int,
+        total_epochs: int,
+        model_name: str,
+        experiment_name: str,
     ) -> tuple[dict[str, float], list[dict[str, Any]]]:
         model.train()
         total_loss = 0.0
@@ -634,9 +754,19 @@ class ExperimentRunner:
         total_aux = 0.0
         total = 0
         correct = 0
+        labels_epoch: list[np.ndarray] = []
+        preds_epoch: list[np.ndarray] = []
+        probs_epoch: list[np.ndarray] = []
+        iteration_store = _empty_iteration_store()
         cartography_rows: list[dict[str, Any]] = []
         optimizer.zero_grad(set_to_none=True)
-        for step, batch in enumerate(loader, start=1):
+        progress = self._progress_bar(
+            loader,
+            total=len(loader),
+            desc=f"{model_name}/{experiment_name} epoch {epoch}/{total_epochs} train",
+        )
+        update_steps = max(1, int(self.config.get("training", {}).get("progress_update_steps", 5)))
+        for step, batch in enumerate(progress, start=1):
             images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
             labels = batch["labels"].to(self.device, non_blocking=True)
             aux = batch["aux_features"].to(self.device, non_blocking=True)
@@ -664,6 +794,13 @@ class ExperimentRunner:
                 true_probs = probs.gather(1, labels.view(-1, 1)).squeeze(1).detach().cpu().numpy()
                 pred_np = preds.detach().cpu().numpy()
                 labels_np = labels.detach().cpu().numpy()
+                labels_epoch.append(labels_np)
+                preds_epoch.append(pred_np)
+                probs_epoch.append(probs.detach().cpu().numpy())
+                _append_iteration_arrays(
+                    iteration_store,
+                    _compute_iteration_arrays(model, features, labels, probs, preds),
+                )
                 for i, sample_id in enumerate(batch["sample_ids"]):
                     cartography_rows.append(
                         {
@@ -675,14 +812,61 @@ class ExperimentRunner:
                             "correct": bool(pred_np[i] == labels_np[i]),
                         }
                     )
+            if step % update_steps == 0 or step == len(loader):
+                running_denom = max(1, total)
+                labels_running = np.concatenate(labels_epoch) if labels_epoch else np.zeros(0, dtype=int)
+                preds_running = np.concatenate(preds_epoch) if preds_epoch else np.zeros(0, dtype=int)
+                probs_running = np.concatenate(probs_epoch) if probs_epoch else None
+                running_class_stats = _classification_stats_from_arrays(labels_running, preds_running, probs_running)
+                running_loss_metrics = _loss_metric_values(total_loss, total_ce, total_aux, running_denom)
+                running_extra = _summarize_iteration_store(iteration_store)
+                iteration_line = _format_iteration_metrics(
+                    "TRAIN",
+                    epoch,
+                    total_epochs,
+                    step,
+                    len(loader),
+                    running_class_stats,
+                    running_loss_metrics,
+                    running_extra,
+                )
+                print(iteration_line, flush=True)
+                self._set_progress_postfix(
+                    progress,
+                    {
+                        "loss": f"{total_loss / running_denom:.4f}",
+                        "acc": f"{correct / running_denom:.3f}",
+                        "f1": f"{running_class_stats['macro_f1']:.3f}",
+                        "ce": f"{total_ce / running_denom:.4f}",
+                    },
+                )
         denom = max(1, total)
+        epoch_metrics = _classification_stats_from_arrays(
+            np.concatenate(labels_epoch) if labels_epoch else np.zeros(0, dtype=int),
+            np.concatenate(preds_epoch) if preds_epoch else np.zeros(0, dtype=int),
+            np.concatenate(probs_epoch) if probs_epoch else None,
+        )
+        epoch_loss_metrics = _loss_metric_values(total_loss, total_ce, total_aux, denom)
+        epoch_extra_metrics = _summarize_iteration_store(iteration_store)
+        train_stats = {
+            "train_loss": total_loss / denom,
+            "train_ce_loss": total_ce / denom,
+            "train_aux_loss": total_aux / denom,
+            "train_accuracy": correct / denom,
+            "train_balanced_accuracy": epoch_metrics["balanced_accuracy"],
+            "train_macro_precision": epoch_metrics["macro_precision"],
+            "train_macro_recall": epoch_metrics["macro_recall"],
+            "train_macro_f1": epoch_metrics["macro_f1"],
+            "train_weighted_precision": epoch_metrics["weighted_precision"],
+            "train_weighted_recall": epoch_metrics["weighted_recall"],
+            "train_weighted_f1": epoch_metrics["weighted_f1"],
+            "train_top2_accuracy": epoch_metrics["top2_accuracy"],
+            "train_top3_accuracy": epoch_metrics["top3_accuracy"],
+        }
+        train_stats.update({f"train_{key}": value for key, value in epoch_loss_metrics.items()})
+        train_stats.update({f"train_{key}": value for key, value in epoch_extra_metrics.items()})
         return (
-            {
-                "train_loss": total_loss / denom,
-                "train_ce_loss": total_ce / denom,
-                "train_aux_loss": total_aux / denom,
-                "train_accuracy": correct / denom,
-            },
+            train_stats,
             cartography_rows,
         )
 
@@ -693,6 +877,7 @@ class ExperimentRunner:
         criterion: nn.Module,
         aux_weight: float,
         collect_embeddings: bool,
+        progress_desc: str | None = None,
     ) -> tuple[dict[str, float], np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
         model.eval()
         total_loss = 0.0
@@ -702,10 +887,14 @@ class ExperimentRunner:
         labels_all: list[np.ndarray] = []
         probs_all: list[np.ndarray] = []
         losses_all: list[np.ndarray] = []
+        preds_all: list[np.ndarray] = []
+        iteration_store = _empty_iteration_store()
         payload: dict[str, Any] = {"sample_ids": [], "image_paths": []}
         embedding_store: dict[str, list[np.ndarray]] = {}
         with torch.no_grad():
-            for batch in loader:
+            progress = self._progress_bar(loader, total=len(loader), desc=progress_desc or "validation")
+            update_steps = max(1, int(self.config.get("training", {}).get("progress_update_steps", 5)))
+            for step, batch in enumerate(progress, start=1):
                 images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
                 labels = batch["labels"].to(self.device, non_blocking=True)
                 aux = batch["aux_features"].to(self.device, non_blocking=True)
@@ -716,6 +905,7 @@ class ExperimentRunner:
                 aux_loss = model.auxiliary_alignment_loss(features) if aux_weight > 0 else logits.new_tensor(0.0)
                 loss = ce + aux_weight * aux_loss
                 probs = torch.softmax(logits, dim=1)
+                preds = probs.argmax(dim=1)
                 batch_size = int(labels.shape[0])
                 total += batch_size
                 total_loss += float(loss.item()) * batch_size
@@ -723,7 +913,12 @@ class ExperimentRunner:
                 total_aux += float(aux_loss.item()) * batch_size
                 labels_all.append(labels.cpu().numpy())
                 probs_all.append(probs.cpu().numpy())
+                preds_all.append(preds.cpu().numpy())
                 losses_all.append(ce_each.detach().cpu().numpy())
+                _append_iteration_arrays(
+                    iteration_store,
+                    _compute_iteration_arrays(model, features, labels, probs, preds),
+                )
                 payload["sample_ids"].extend(batch["sample_ids"])
                 payload["image_paths"].extend(batch["image_paths"])
                 if collect_embeddings:
@@ -732,6 +927,34 @@ class ExperimentRunner:
                             key.endswith("_embedding") or key.endswith("_projected_embedding") or key in {"fused_visual_embedding", "probabilities", "aux_input"}
                         ):
                             embedding_store.setdefault(key, []).append(value.detach().cpu().numpy())
+                if step % update_steps == 0 or step == len(loader):
+                    denom_running = max(1, total)
+                    labels_running = np.concatenate(labels_all) if labels_all else np.zeros(0, dtype=int)
+                    preds_running = np.concatenate(preds_all) if preds_all else np.zeros(0, dtype=int)
+                    probs_running = np.concatenate(probs_all) if probs_all else None
+                    running_class_stats = _classification_stats_from_arrays(labels_running, preds_running, probs_running)
+                    running_loss_metrics = _loss_metric_values(total_loss, total_ce, total_aux, denom_running)
+                    running_extra = _summarize_iteration_store(iteration_store)
+                    iteration_line = _format_iteration_metrics(
+                        "VAL",
+                        None,
+                        None,
+                        step,
+                        len(loader),
+                        running_class_stats,
+                        running_loss_metrics,
+                        running_extra,
+                    )
+                    print(iteration_line, flush=True)
+                    self._set_progress_postfix(
+                        progress,
+                        {
+                            "loss": f"{total_loss / denom_running:.4f}",
+                            "acc": f"{running_class_stats['accuracy']:.3f}",
+                            "f1": f"{running_class_stats['macro_f1']:.3f}",
+                            "ce": f"{total_ce / denom_running:.4f}",
+                        },
+                    )
         labels_np = np.concatenate(labels_all) if labels_all else np.zeros(0, dtype=int)
         probs_np = np.concatenate(probs_all) if probs_all else np.zeros((0, 0), dtype=np.float32)
         losses_np = np.concatenate(losses_all) if losses_all else np.zeros(0, dtype=np.float32)
@@ -740,8 +963,40 @@ class ExperimentRunner:
         payload["labels"] = labels_np
         payload["probabilities"] = probs_np
         denom = max(1, total)
-        stats = {"loss": total_loss / denom, "ce_loss": total_ce / denom, "aux_loss": total_aux / denom}
+        pred_np = probs_np.argmax(axis=1) if probs_np.size else np.zeros(0, dtype=int)
+        class_stats = _classification_stats_from_arrays(labels_np, pred_np, probs_np if probs_np.size else None)
+        loss_metrics = _loss_metric_values(total_loss, total_ce, total_aux, denom)
+        extra_metrics = _summarize_iteration_store(iteration_store)
+        stats = {
+            "loss": total_loss / denom,
+            "ce_loss": total_ce / denom,
+            "aux_loss": total_aux / denom,
+            **class_stats,
+            **loss_metrics,
+            **extra_metrics,
+        }
         return stats, labels_np, probs_np, losses_np, payload
+
+    def _progress_bar(self, iterable: Any, total: int, desc: str) -> Any:
+        enabled = bool(self.config.get("training", {}).get("progress_bar", True))
+        if not enabled or tqdm is None:
+            print(f"[PROGRESS] {desc}: {total} batches", flush=True)
+            return iterable
+        return tqdm(
+            iterable,
+            total=total,
+            desc=desc,
+            file=sys.stdout,
+            dynamic_ncols=True,
+            leave=True,
+            mininterval=1.0,
+            ascii=True,
+        )
+
+    @staticmethod
+    def _set_progress_postfix(progress: Any, values: dict[str, str]) -> None:
+        if hasattr(progress, "set_postfix"):
+            progress.set_postfix(values, refresh=False)
 
     def _write_cartography(self, run_dir: Path, rows: list[dict[str, Any]]) -> None:
         save_csv(run_dir / "cartography" / "training_dynamics.csv", rows)
@@ -881,7 +1136,8 @@ class ExperimentRunner:
                 "class_to_index": bundle.class_to_index,
                 "index_to_class": {str(k): v for k, v in bundle.index_to_class.items()},
                 "class_names": class_names,
-                "model_metadata": model.metadata(),
+                "asset_filter_summary": bundle.asset_filter_summary,
+                "model_metadata": {**model.metadata(), "parameter_counts": count_model_parameters(model)},
                 "primary_metrics": {k: v for k, v in metrics.items() if isinstance(v, (int, float, str, bool))},
                 "shap_enabled": False,
                 "completed_at": utc_now(),
@@ -956,3 +1212,299 @@ def flatten_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, (int, float, str, bool)) or value is None:
             flat[key] = value
     return flat
+
+
+ITERATION_METRIC_ORDER = (
+    "acc",
+    "bal_acc",
+    "macro_precision",
+    "macro_recall",
+    "macro_f1",
+    "weighted_f1",
+    "top_2_acc",
+    "top_3_acc",
+    "loss",
+    "combined_cls_loss",
+    "visual_cls_loss",
+    "description_cls_loss",
+    "enhanced_visual_loss",
+    "align_loss",
+    "consistency_loss",
+    "contrastive_loss",
+    "prototype_separation_loss",
+    "fusion_gate",
+    "visual_acc",
+    "description_acc",
+    "branch_agreement",
+    "fused_visual_agreement",
+    "fused_text_agreement",
+    "enhancement_agreement",
+    "base_visual_acc",
+    "enhanced_visual_acc",
+    "true_visual_prob",
+    "true_description_prob",
+    "true_fused_prob",
+    "true_text_similarity",
+    "top_text_similarity",
+    "avg_fusion_gate",
+    "gate_correct_gap",
+)
+
+
+ITERATION_ARRAY_KEYS = (
+    "fusion_gate",
+    "avg_fusion_gate",
+    "branch_agreement",
+    "fused_visual_agreement",
+    "fused_text_agreement",
+    "base_visual_correct",
+    "enhanced_visual_correct",
+    "true_visual_prob",
+    "true_fused_prob",
+    "true_text_similarity",
+    "top_text_similarity",
+)
+
+
+def _nan() -> float:
+    return float("nan")
+
+
+def _loss_metric_values(total_loss: float, total_ce: float, total_aux: float, denom: int) -> dict[str, float]:
+    denom = max(1, denom)
+    return {
+        "loss": total_loss / denom,
+        "combined_cls_loss": total_ce / denom,
+        "visual_cls_loss": total_ce / denom,
+        "description_cls_loss": _nan(),
+        "enhanced_visual_loss": _nan(),
+        "align_loss": total_aux / denom,
+        "consistency_loss": _nan(),
+        "contrastive_loss": _nan(),
+        "prototype_separation_loss": _nan(),
+    }
+
+
+def _empty_iteration_store() -> dict[str, list[np.ndarray]]:
+    return {key: [] for key in ITERATION_ARRAY_KEYS}
+
+
+def _append_iteration_arrays(store: dict[str, list[np.ndarray]], arrays: dict[str, np.ndarray]) -> None:
+    for key, value in arrays.items():
+        if key in store and value.size:
+            store[key].append(value.astype(np.float32, copy=False))
+
+
+def _compute_iteration_arrays(
+    model: FiveBranchExperimentModel,
+    features: dict[str, Any],
+    labels: torch.Tensor,
+    probs: torch.Tensor,
+    preds: torch.Tensor,
+) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {}
+    labels_col = labels.view(-1, 1)
+    correct = (preds == labels).detach().float().cpu().numpy()
+    arrays["enhanced_visual_correct"] = correct
+    arrays["true_fused_prob"] = probs.gather(1, labels_col).squeeze(1).detach().float().cpu().numpy()
+
+    original_projected = features.get("original_projected_embedding")
+    fused_visual = features.get("fused_visual_embedding")
+    if isinstance(original_projected, torch.Tensor):
+        base_logits = model.classifier(original_projected)
+        base_probs = torch.softmax(base_logits, dim=1)
+        base_preds = base_probs.argmax(dim=1)
+        arrays["base_visual_correct"] = (base_preds == labels).detach().float().cpu().numpy()
+        arrays["true_visual_prob"] = base_probs.gather(1, labels_col).squeeze(1).detach().float().cpu().numpy()
+    if isinstance(fused_visual, torch.Tensor) and isinstance(original_projected, torch.Tensor):
+        arrays["fused_visual_agreement"] = _cosine_numpy(fused_visual, original_projected)
+
+    agreement_tensors: list[torch.Tensor] = []
+    if isinstance(original_projected, torch.Tensor):
+        for key, value in features.items():
+            if key.endswith("_projected_embedding") and key != "original_projected_embedding" and isinstance(value, torch.Tensor):
+                agreement_tensors.append(F.cosine_similarity(F.normalize(original_projected.float(), dim=1), F.normalize(value.float(), dim=1), dim=1))
+    if agreement_tensors:
+        arrays["branch_agreement"] = torch.stack(agreement_tensors, dim=1).mean(dim=1).detach().float().cpu().numpy()
+
+    gates = features.get("branch_gates")
+    if isinstance(gates, dict) and gates:
+        gate_tensors = [value.float().mean(dim=1) for value in gates.values() if isinstance(value, torch.Tensor)]
+        if gate_tensors:
+            per_sample_gate = torch.stack(gate_tensors, dim=1).mean(dim=1).detach().float().cpu().numpy()
+            arrays["fusion_gate"] = per_sample_gate
+            arrays["avg_fusion_gate"] = per_sample_gate
+
+    aux_embedding = features.get("aux_embedding")
+    if isinstance(fused_visual, torch.Tensor) and isinstance(aux_embedding, torch.Tensor):
+        text_similarity = _cosine_numpy(fused_visual, aux_embedding)
+        arrays["fused_text_agreement"] = text_similarity
+        arrays["true_text_similarity"] = text_similarity
+        fused_norm = F.normalize(fused_visual.float(), dim=1)
+        aux_norm = F.normalize(aux_embedding.float(), dim=1)
+        arrays["top_text_similarity"] = torch.matmul(fused_norm, aux_norm.T).max(dim=1).values.detach().float().cpu().numpy()
+    return arrays
+
+
+def _cosine_numpy(left: torch.Tensor, right: torch.Tensor) -> np.ndarray:
+    return F.cosine_similarity(F.normalize(left.float(), dim=1), F.normalize(right.float(), dim=1), dim=1).detach().float().cpu().numpy()
+
+
+def _summarize_iteration_store(store: dict[str, list[np.ndarray]]) -> dict[str, float]:
+    def mean_of(key: str) -> float:
+        chunks = store.get(key, [])
+        if not chunks:
+            return _nan()
+        values = np.concatenate(chunks)
+        if values.size == 0:
+            return _nan()
+        return float(np.nanmean(values))
+
+    summary = {
+        "fusion_gate": mean_of("fusion_gate"),
+        "visual_acc": mean_of("enhanced_visual_correct"),
+        "description_acc": _nan(),
+        "branch_agreement": mean_of("branch_agreement"),
+        "fused_visual_agreement": mean_of("fused_visual_agreement"),
+        "fused_text_agreement": mean_of("fused_text_agreement"),
+        "enhancement_agreement": _nan(),
+        "base_visual_acc": mean_of("base_visual_correct"),
+        "enhanced_visual_acc": mean_of("enhanced_visual_correct"),
+        "true_visual_prob": mean_of("true_visual_prob"),
+        "true_description_prob": _nan(),
+        "true_fused_prob": mean_of("true_fused_prob"),
+        "true_text_similarity": mean_of("true_text_similarity"),
+        "top_text_similarity": mean_of("top_text_similarity"),
+        "avg_fusion_gate": mean_of("avg_fusion_gate"),
+        "gate_correct_gap": _nan(),
+    }
+    gate_chunks = store.get("avg_fusion_gate", [])
+    correct_chunks = store.get("enhanced_visual_correct", [])
+    if gate_chunks and correct_chunks:
+        gates = np.concatenate(gate_chunks)
+        correct = np.concatenate(correct_chunks).astype(bool)
+        if np.any(correct) and np.any(~correct):
+            summary["gate_correct_gap"] = float(np.nanmean(gates[correct]) - np.nanmean(gates[~correct]))
+    return summary
+
+
+def _format_iteration_metrics(
+    stage: str,
+    epoch: int | None,
+    total_epochs: int | None,
+    step: int,
+    total_steps: int,
+    class_stats: dict[str, float],
+    loss_metrics: dict[str, float],
+    extra_metrics: dict[str, float],
+) -> str:
+    metrics = {
+        "acc": class_stats.get("accuracy", _nan()),
+        "bal_acc": class_stats.get("balanced_accuracy", _nan()),
+        "macro_precision": class_stats.get("macro_precision", _nan()),
+        "macro_recall": class_stats.get("macro_recall", _nan()),
+        "macro_f1": class_stats.get("macro_f1", _nan()),
+        "weighted_f1": class_stats.get("weighted_f1", _nan()),
+        "top_2_acc": class_stats.get("top2_accuracy", _nan()),
+        "top_3_acc": class_stats.get("top3_accuracy", _nan()),
+        **loss_metrics,
+        **extra_metrics,
+    }
+    prefix = f"{stage} | iter={step}/{total_steps}"
+    if epoch is not None and total_epochs is not None:
+        prefix = f"{stage} | epoch={epoch}/{total_epochs} | iter={step}/{total_steps}"
+    parts = [prefix]
+    parts.extend(f"{key}={_format_metric_value(metrics.get(key, _nan()))}" for key in ITERATION_METRIC_ORDER)
+    return " | ".join(parts)
+
+
+def _format_metric_value(value: Any) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(number):
+        return "nan"
+    return f"{number:.4f}"
+
+
+def count_model_parameters(model: nn.Module) -> dict[str, float | int]:
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    frozen = total - trainable
+    return {
+        "total": int(total),
+        "trainable": int(trainable),
+        "frozen": int(frozen),
+        "total_millions": total / 1_000_000.0,
+        "trainable_millions": trainable / 1_000_000.0,
+        "frozen_millions": frozen / 1_000_000.0,
+    }
+
+
+def _classification_stats_from_arrays(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    probs: np.ndarray | None = None,
+) -> dict[str, float]:
+    if y_true.size == 0:
+        return {
+            "accuracy": 0.0,
+            "balanced_accuracy": 0.0,
+            "macro_precision": 0.0,
+            "macro_recall": 0.0,
+            "macro_f1": 0.0,
+            "weighted_precision": 0.0,
+            "weighted_recall": 0.0,
+            "weighted_f1": 0.0,
+            "top2_accuracy": 0.0,
+            "top3_accuracy": 0.0,
+        }
+    try:
+        from sklearn.metrics import accuracy_score, balanced_accuracy_score, precision_recall_fscore_support
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
+                y_true,
+                y_pred,
+                average="macro",
+                zero_division=0,
+            )
+            weighted_p, weighted_r, weighted_f1, _ = precision_recall_fscore_support(
+                y_true,
+                y_pred,
+                average="weighted",
+                zero_division=0,
+            )
+            accuracy = float(accuracy_score(y_true, y_pred))
+            balanced = float(balanced_accuracy_score(y_true, y_pred))
+    except Exception:
+        accuracy = float(np.mean(y_true == y_pred))
+        balanced = accuracy
+        macro_p = macro_r = macro_f1 = weighted_p = weighted_r = weighted_f1 = 0.0
+    top2 = 0.0
+    top3 = 0.0
+    if probs is not None and probs.size:
+        top2 = _topk_accuracy(y_true, probs, 2)
+        top3 = _topk_accuracy(y_true, probs, 3)
+    return {
+        "accuracy": accuracy,
+        "balanced_accuracy": balanced,
+        "macro_precision": float(macro_p),
+        "macro_recall": float(macro_r),
+        "macro_f1": float(macro_f1),
+        "weighted_precision": float(weighted_p),
+        "weighted_recall": float(weighted_r),
+        "weighted_f1": float(weighted_f1),
+        "top2_accuracy": top2,
+        "top3_accuracy": top3,
+    }
+
+
+def _topk_accuracy(y_true: np.ndarray, probs: np.ndarray, k: int) -> float:
+    if y_true.size == 0 or probs.size == 0:
+        return 0.0
+    k = max(1, min(k, probs.shape[1]))
+    topk = np.argsort(probs, axis=1)[:, -k:]
+    return float(np.mean([y_true[i] in topk[i] for i in range(len(y_true))]))

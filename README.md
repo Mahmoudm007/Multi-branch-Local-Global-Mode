@@ -57,6 +57,8 @@ Resume or repair a previous generation:
 python run_all_branches.py --skip-completed true
 ```
 
+The resume path validates the current expected suffixed output file before skipping. This means stale progress CSV rows cannot hide missing `_CROP`, `_THERMAL`, or `_SEG` files.
+
 Smoke test:
 
 ```bash
@@ -71,12 +73,15 @@ Useful outputs:
 - `Generated_Branches/previews/*_preview.png`
 - `Generated_Branches/previews/cropped_local_*_crop_audit.png`
 
+During training, any remaining missing or corrupt generated branch assets are filtered out of that run instead of crashing the full benchmark. The exclusion details are written per run to `Output/<model>/<experiment>/metadata/asset_exclusions.csv` and summarized in `asset_filter_summary.json`; training still fails if filtering would leave the train or validation split empty.
+
 ## Experiment Registry
 
 Default experiments are the 15 required combinations:
 
 ```text
 exp_original_thermal_segmented_cropped_auxtext
+exp_original_thermal_cropped_auxtext
 exp_original_thermal
 exp_original_segmented
 exp_original_cropped
@@ -89,7 +94,6 @@ exp_original_segmented_auxtext
 exp_original_cropped_auxtext
 exp_original_thermal_segmented_cropped
 exp_original_thermal_segmented_auxtext
-exp_original_thermal_cropped_auxtext
 exp_original_segmented_cropped_auxtext
 ```
 
