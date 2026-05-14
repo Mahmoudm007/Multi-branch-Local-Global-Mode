@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sequential benchmark launcher for SDRE.
-#SBATCH --job-name=Multi-branch Local-Global
+#SBATCH --job-name=Multi-branch_Local-Global
 #SBATCH --partition=gpu-h200
 #SBATCH --gres=gpu:8
 #SBATCH --qos=normal
@@ -51,7 +51,7 @@ MODEL="${MODEL:-}"
 EXPERIMENT="${EXPERIMENT:-}"
 INCLUDE_ORIGINAL_ONLY="${INCLUDE_ORIGINAL_ONLY:-true}"
 
-mkdir -p weights "$HF_HUB_CACHE" "$TORCH_HOME" "$TIMM_HOME" "$TRANSFORMERS_CACHE" Output/_global_comparison_per_combination
+mkdir -p weights "$HF_HUB_CACHE" "$TORCH_HOME" "$TIMM_HOME" "$TRANSFORMERS_CACHE" Output_v3/_global_comparison_per_combination
 
 echo "Host: $(hostname)"
 echo "Working dir: $(pwd)"

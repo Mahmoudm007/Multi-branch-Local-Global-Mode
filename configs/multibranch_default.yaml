@@ -22,8 +22,8 @@ training:
   mixed_precision: true
   gradient_accumulation_steps: 1
   early_stopping_patience: 8
-  monitor_metric: val_loss
-  checkpoint_metric: val_loss
+  monitor_metric: val_accuracy
+  checkpoint_metric: val_accuracy
   progress_bar: true
   progress_update_steps: 1
   epoch_progress_log: true

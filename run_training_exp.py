@@ -23,8 +23,8 @@ def parse_args() -> argparse.Namespace:
     experiments = [spec.name for spec in build_experiments(include_original_only=True)]
     parser = argparse.ArgumentParser(description="Run the five-branch winter road benchmark sequentially.")
     parser.add_argument("--config", default="configs/multibranch_default.yaml", help="YAML config path.")
-    parser.add_argument("--output-root", default="Output_v2", help="Benchmark output root.")
-    parser.add_argument("--dataset-root", default=None, help="Override supervised dataset root.")
+    parser.add_argument("--output-root", default="Output_v3", help="Benchmark output root.")
+    parser.add_argument("--dataset-root", default="Dataset_classes_v1", help="Override supervised dataset root.")
     parser.add_argument("--asset-root", default=None, help="Override generated branch asset root.")
     parser.add_argument("--defined-folder", default=None, help="Override defined dataset folder.")
     parser.add_argument("--model", choices=list(MODEL_FAMILIES), default=None, help="Run one model family across selected experiments.")

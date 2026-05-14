@@ -4,6 +4,7 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -113,7 +114,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "seed": 42,
         "deterministic": True,
         "device": "auto",
-        "epochs": 25,
+        "epochs": 30,
         "batch_size": 64,
         "num_workers": 4,
         "pin_memory": True,
@@ -124,8 +125,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mixed_precision": True,
         "gradient_accumulation_steps": 1,
         "early_stopping_patience": 8,
-        "monitor_metric": "val_loss",
-        "checkpoint_metric": "val_loss",
+        "monitor_metric": "val_accuracy",
+        "checkpoint_metric": "val_accuracy",
         "progress_bar": True,
         "progress_update_steps": 1,
         "epoch_progress_log": True,
@@ -235,6 +236,49 @@ def is_complete(run_dir: Path) -> bool:
         return summary.get("status") == "complete" and int(summary.get("artifact_schema_version", 0)) >= CURRENT_ARTIFACT_SCHEMA_VERSION
     except Exception:
         return False
+
+
+def metric_mode(metric_name: str) -> str:
+    lowered = metric_name.lower()
+    if any(token in lowered for token in ("loss", "error", "ece", "brier")):
+        return "min"
+    return "max"
+
+
+def initial_metric_value(mode: str) -> float:
+    return float("inf") if mode == "min" else float("-inf")
+
+
+def metric_improved(value: float, best_value: float, mode: str) -> bool:
+    if not math.isfinite(value):
+        return False
+    if mode == "min":
+        return value < best_value
+    return value > best_value
+
+
+def resolve_metric_value(
+    metric_name: str,
+    row: dict[str, Any],
+    train_stats: dict[str, Any],
+    val_stats: dict[str, Any],
+) -> float:
+    candidates: list[Any] = []
+    if metric_name in row:
+        candidates.append(row[metric_name])
+    if metric_name.startswith("val_"):
+        candidates.append(val_stats.get(metric_name.removeprefix("val_")))
+    elif metric_name.startswith("train_"):
+        candidates.append(train_stats.get(metric_name))
+    else:
+        candidates.extend((val_stats.get(metric_name), train_stats.get(metric_name)))
+
+    for value in candidates:
+        if value is not None:
+            return float(value)
+
+    available = ", ".join(sorted(row))
+    raise KeyError(f"Metric {metric_name!r} is not available. Available metrics: {available}")
 
 
 @dataclass
@@ -616,7 +660,12 @@ class ExperimentRunner:
         cartography_rows: list[dict[str, Any]] = []
         high_loss_epoch_rows: list[dict[str, Any]] = []
         high_loss_top_k = int(self.config.get("evaluation", {}).get("high_loss_top_k_per_epoch", 50))
-        best_metric = float("inf")
+        monitor_metric = str(train_cfg.get("monitor_metric", "val_accuracy"))
+        checkpoint_metric = str(train_cfg.get("checkpoint_metric", monitor_metric))
+        monitor_mode = metric_mode(monitor_metric)
+        checkpoint_mode = metric_mode(checkpoint_metric)
+        best_monitor_metric = initial_metric_value(monitor_mode)
+        best_checkpoint_metric = initial_metric_value(checkpoint_mode)
         best_epoch = 0
         patience = configured_patience
         stale = 0
@@ -662,23 +711,44 @@ class ExperimentRunner:
             history.append(row)
             save_csv(run_dir / "logs" / "history.csv", history)
             torch.save(
-                {"model": model.state_dict(), "epoch": epoch, "config": self.config, "metadata": model.metadata()},
+                {
+                    "model": model.state_dict(),
+                    "epoch": epoch,
+                    "config": self.config,
+                    "metadata": model.metadata(),
+                    "monitor_metric": monitor_metric,
+                    "monitor_value": resolve_metric_value(monitor_metric, row, train_stats, val_stats),
+                    "checkpoint_metric": checkpoint_metric,
+                    "checkpoint_value": resolve_metric_value(checkpoint_metric, row, train_stats, val_stats),
+                },
                 run_dir / "checkpoints" / "last.pt",
             )
-            monitor_value = float(val_stats["loss"])
+            monitor_value = resolve_metric_value(monitor_metric, row, train_stats, val_stats)
+            checkpoint_value = resolve_metric_value(checkpoint_metric, row, train_stats, val_stats)
             should_stop = False
-            if monitor_value < best_metric:
-                best_metric = monitor_value
-                best_epoch = epoch
+            if metric_improved(monitor_value, best_monitor_metric, monitor_mode):
+                best_monitor_metric = monitor_value
                 stale = 0
-                torch.save(
-                    {"model": model.state_dict(), "epoch": epoch, "config": self.config, "metadata": model.metadata()},
-                    run_dir / "checkpoints" / "best.pt",
-                )
             else:
                 stale += 1
                 if stale >= patience:
                     should_stop = True
+            if metric_improved(checkpoint_value, best_checkpoint_metric, checkpoint_mode):
+                best_checkpoint_metric = checkpoint_value
+                best_epoch = epoch
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "epoch": epoch,
+                        "config": self.config,
+                        "metadata": model.metadata(),
+                        "monitor_metric": monitor_metric,
+                        "monitor_value": monitor_value,
+                        "checkpoint_metric": checkpoint_metric,
+                        "checkpoint_value": checkpoint_value,
+                    },
+                    run_dir / "checkpoints" / "best.pt",
+                )
             epoch_line = (
                 f"[EPOCH {epoch}/{epochs}] done: "
                 f"train_loss={train_stats['train_loss']:.4f} "
@@ -697,6 +767,8 @@ class ExperimentRunner:
                 f"val_top2={val_stats['top2_accuracy']:.4f} "
                 f"val_top3={val_stats['top3_accuracy']:.4f} "
                 f"val_aux={val_stats['aux_loss']:.4f} "
+                f"{monitor_metric}={monitor_value:.4f} "
+                f"best_{checkpoint_metric}={best_checkpoint_metric:.4f} "
                 f"best_epoch={best_epoch}"
             )
             self._emit_epoch_progress(run_dir, epoch_line)
@@ -722,7 +794,17 @@ class ExperimentRunner:
         )
         prediction_rows = save_predictions(run_dir, payload["sample_ids"], payload["image_paths"], y_true, probs, losses, class_names)
         metrics, calibration_rows = compute_metrics(y_true, probs, class_names)
-        metrics.update({"val_loss": float(val_stats["loss"]), "best_epoch": best_epoch})
+        metrics.update(
+            {
+                "val_loss": float(val_stats["loss"]),
+                "val_accuracy": float(val_stats["accuracy"]),
+                "monitor_metric": monitor_metric,
+                "best_monitor_metric": float(best_monitor_metric),
+                "checkpoint_metric": checkpoint_metric,
+                "best_checkpoint_metric": float(best_checkpoint_metric),
+                "best_epoch": best_epoch,
+            }
+        )
         atomic_write_json(run_dir / "metrics" / "metrics.json", metrics)
         save_csv(run_dir / "metrics" / "metrics.csv", [flatten_metrics(metrics)])
         save_csv(run_dir / "metrics" / "calibration_table.csv", calibration_rows)

@@ -46,7 +46,8 @@ export TIMM_HOME="$CLB_PRETRAINED_CACHE_DIR/timm"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 
 CONFIG_PATH="${CONFIG_PATH:-configs/multibranch_default.yaml}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-Output_v2}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-Output_v3}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
 
 mkdir -p weights "$HF_HUB_CACHE" "$TORCH_HOME" "$TIMM_HOME" "$TRANSFORMERS_CACHE" "$OUTPUT_ROOT/_global_comparison_per_combination"
 
@@ -54,6 +55,7 @@ echo "Host: $(hostname)"
 echo "Working dir: $(pwd)"
 echo "Config: $CONFIG_PATH"
 echo "Output root: $OUTPUT_ROOT"
+echo "Num workers: $NUM_WORKERS"
 echo "Python: $(which python)"
 nvidia-smi -L || true
 python - <<'PY'
@@ -65,5 +67,5 @@ if torch.cuda.is_available():
     print("cuda_device_0:", torch.cuda.get_device_name(0))
 PY
 
-python -u run_all_branches.py --num-workers 0
+python -u run_all_branches.py --num-workers "$NUM_WORKERS" --skip-completed true
  

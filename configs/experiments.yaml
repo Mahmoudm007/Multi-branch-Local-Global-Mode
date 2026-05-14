@@ -29,6 +29,9 @@ default_experiments:
   - exp_original_only
   - exp_original_thermal_segmented_cropped_auxtext
   - exp_original_thermal_cropped_auxtext
+  - exp_original_thermal_segmented_cropped
+  - exp_original_thermal_segmented_auxtext
+  - exp_original_segmented_cropped_auxtext
   - exp_original_thermal
   - exp_original_segmented
   - exp_original_cropped
@@ -39,8 +42,6 @@ default_experiments:
   - exp_original_segmented_cropped
   - exp_original_segmented_auxtext
   - exp_original_cropped_auxtext
-  - exp_original_thermal_segmented_cropped
-  - exp_original_thermal_segmented_auxtext
-  - exp_original_segmented_cropped_auxtext
+
 
 optional_experiments: []

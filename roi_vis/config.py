@@ -61,7 +61,7 @@ class MorphologyConfig:
 class DatasetConfig:
     """Dataset structure configuration."""
 
-    input_root: Path = Path('Dataset_Classes_v1')
+    input_root: Path = Path('Dataset_classes_v1')
     output_root: Path = Path('outputs')
     defined_folder_name: str = '1 Defined'
     ignore_folders: List[str] = field(default_factory=lambda: ['0 Undefined'])
