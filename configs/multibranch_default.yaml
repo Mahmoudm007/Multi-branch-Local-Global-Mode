@@ -1,5 +1,5 @@
 data:
-  dataset_root: Dataset_classes
+  dataset_root: Dataset_classes_v1
   defined_folder: "1 Defined"
   asset_root: Generated_Branches
   image_size: 224
@@ -26,6 +26,8 @@ training:
   checkpoint_metric: val_loss
   progress_bar: true
   progress_update_steps: 1
+  epoch_progress_log: true
+  epoch_progress_to_stderr: true
   stop_on_run_failure: true
   class_weights:
     enabled: true
@@ -44,24 +46,27 @@ pretrained:
   fallback_random_epochs: 35
 
 tfidf:
-  max_features: 2048
+  max_features: 4000
   ngram_min: 1
   ngram_max: 2
   min_df: 1
-  stop_words: english
-  use_svd: false
-  svd_components: 256
+  stop_words: null
+  use_svd: true
+  svd_components: 128
+  svd_normalize: true
 
 fusion:
   mode: gated
   hidden_dim: 512
-  aux_hidden_dim: 256
+  aux_hidden_dim: 512
+  aux_align_dim: 256
   dropout: 0.2
-  auxiliary_loss_weight: 0.05
+  auxiliary_loss_weight: 0.15
   separate_branch_backbones: false
 
 evaluation:
   top_k_samples: 20
+  high_loss_top_k_per_epoch: 50
 
 explainability:
   splits: [val]

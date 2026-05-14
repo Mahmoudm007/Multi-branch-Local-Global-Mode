@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate cropped, CLAHE-Inferno thermal, and classical BEST_COMBINED branch assets."
     )
-    parser.add_argument("--dataset-root", default="Dataset_classes", help="Root containing the supervised dataset.")
+    parser.add_argument("--dataset-root", default="Dataset_classes_v1", help="Root containing the supervised dataset.")
     parser.add_argument("--defined-folder", default="1 Defined", help="Defined dataset subfolder to process.")
     parser.add_argument("--asset-root", default="Generated_Branches", help="Root for generated branch datasets.")
     parser.add_argument(

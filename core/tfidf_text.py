@@ -7,11 +7,15 @@ import pickle
 import numpy as np
 
 try:
+    from sklearn.preprocessing import Normalizer
     from sklearn.decomposition import TruncatedSVD
     from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.pipeline import make_pipeline
 except Exception:  # pragma: no cover - reported by availability checks
+    Normalizer = None
     TruncatedSVD = None
     TfidfVectorizer = None
+    make_pipeline = None
 
 from class_descriptions import description_for_class, normalize_class_name
 from .progress_tracker import ensure_dir
@@ -26,6 +30,7 @@ class TfidfSettings:
     stop_words: str | None = "english"
     use_svd: bool = False
     svd_components: int = 256
+    svd_normalize: bool = True
     random_state: int = 42
 
 
@@ -44,7 +49,7 @@ class TfidfDescriptionEncoder:
             stop_words=settings.stop_words,
             dtype=np.float32,
         )
-        self.svd = None
+        self.reducer = None
         self.feature_dim = 0
 
     def fit_transform(self, texts: list[str]) -> np.ndarray:
@@ -53,8 +58,14 @@ class TfidfDescriptionEncoder:
             max_rank = min(sparse.shape[0] - 1, sparse.shape[1] - 1)
             if max_rank >= 2:
                 n_components = min(self.settings.svd_components, max_rank)
-                self.svd = TruncatedSVD(n_components=n_components, random_state=self.settings.random_state)
-                dense = self.svd.fit_transform(sparse).astype(np.float32)
+                if self.settings.svd_normalize and Normalizer is not None and make_pipeline is not None:
+                    self.reducer = make_pipeline(
+                        TruncatedSVD(n_components=n_components, random_state=self.settings.random_state),
+                        Normalizer(copy=False),
+                    )
+                else:
+                    self.reducer = TruncatedSVD(n_components=n_components, random_state=self.settings.random_state)
+                dense = self.reducer.fit_transform(sparse).astype(np.float32)
             else:
                 dense = sparse.toarray().astype(np.float32)
         else:
@@ -64,8 +75,8 @@ class TfidfDescriptionEncoder:
 
     def transform(self, texts: list[str]) -> np.ndarray:
         sparse = self.vectorizer.transform(texts)
-        if self.svd is not None:
-            return self.svd.transform(sparse).astype(np.float32)
+        if self.reducer is not None:
+            return self.reducer.transform(sparse).astype(np.float32)
         return sparse.toarray().astype(np.float32)
 
     def save(self, path: Path) -> None:
@@ -87,6 +98,7 @@ def settings_from_config(config: dict) -> TfidfSettings:
         stop_words=stop_words,
         use_svd=bool(tfidf.get("use_svd", False)),
         svd_components=int(tfidf.get("svd_components", 256)),
+        svd_normalize=bool(tfidf.get("svd_normalize", True)),
         random_state=int(tfidf.get("random_state", 42)),
     )
 
@@ -130,4 +142,3 @@ def build_class_description_matrix(
             writer.writeheader()
             writer.writerows(rows)
     return matrix.astype(np.float32), encoder, rows
-

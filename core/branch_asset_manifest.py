@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .experiment_registry import build_class_mapping, discover_class_folders
 
@@ -16,6 +17,12 @@ BRANCH_FILENAME_SUFFIXES = {
     "thermal": "THERMAL",
     "segmented": "SEG",
 }
+
+CROP_TOP_REMOVED = 0.25
+CROP_BOTTOM_REMOVED = 0.30
+CROP_LEFT_REMOVED = 0.10
+CROP_RIGHT_REMOVED = 0.10
+SEGMENTED_OUTPUT_SIZE = (960, 720)
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,29 @@ def output_path_for_record(branch_defined_root: Path, record: ImageRecord, branc
     return branch_defined_root / relative_path
 
 
+def crop_box_for_size(width: int, height: int) -> tuple[int, int, int, int]:
+    left = int(math.floor(CROP_LEFT_REMOVED * width))
+    top = int(math.floor(CROP_TOP_REMOVED * height))
+    right = int(math.ceil((1.0 - CROP_RIGHT_REMOVED) * width))
+    bottom = int(math.ceil((1.0 - CROP_BOTTOM_REMOVED) * height))
+    top = max(0, min(height - 1, top))
+    bottom = max(top + 1, min(height, bottom))
+    left = max(0, min(width - 1, left))
+    right = max(left + 1, min(width, right))
+    return left, top, right, bottom
+
+
+def expected_output_size_for_record(record: ImageRecord, branch: str) -> tuple[int, int] | None:
+    if branch in {"cropped", "thermal"}:
+        with Image.open(record.source_path) as image:
+            width, height = ImageOps.exif_transpose(image).size
+        left, top, right, bottom = crop_box_for_size(width, height)
+        return right - left, bottom - top
+    if branch == "segmented":
+        return SEGMENTED_OUTPUT_SIZE
+    return None
+
+
 def validate_image_file(path: Path) -> tuple[bool, str, tuple[int, int] | None, str | None]:
     try:
         if not path.exists():
@@ -121,6 +151,21 @@ def validate_image_file(path: Path) -> tuple[bool, str, tuple[int, int] | None, 
         return True, "ok", size, mode
     except Exception as exc:  # noqa: BLE001 - validation must report all image failures
         return False, f"unreadable:{exc}", None, None
+
+
+def validate_generated_image_file(path: Path, record: ImageRecord, branch: str) -> tuple[bool, str, tuple[int, int] | None, str | None]:
+    valid, message, size, mode = validate_image_file(path)
+    if not valid:
+        return valid, message, size, mode
+    expected_size = expected_output_size_for_record(record, branch)
+    if expected_size is not None and size != expected_size:
+        return (
+            False,
+            f"wrong_size:{size[0]}x{size[1]}_expected_{expected_size[0]}x{expected_size[1]}",
+            size,
+            mode,
+        )
+    return valid, message, size, mode
 
 
 def summarize_records(records: Iterable[ImageRecord]) -> dict[str, dict[str, int]]:

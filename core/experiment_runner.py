@@ -30,11 +30,13 @@ except Exception:  # pragma: no cover - progress falls back to plain prints
 
 from .data_loading import build_dataloaders, compute_class_weights, prepare_data_bundle
 from .evaluation_artifacts import (
+    build_prediction_rows,
     compute_metrics,
     ensure_run_layout,
     save_classification_report_text,
     save_confusion,
     save_embedding_and_advanced_outputs,
+    save_epoch_high_loss_samples,
     save_grad_saliency_panels,
     save_patch_occlusion_and_faithfulness,
     save_predictions,
@@ -71,6 +73,7 @@ REQUIRED_COMPLETION_ARTIFACTS = (
     "checkpoints/best.pt",
     "checkpoints/last.pt",
     "logs/history.csv",
+    "high_loss_samples/high_loss_epoch_manifest.csv",
     "metrics/metrics.json",
     "predictions/predictions.csv",
     "confusion/confusion_matrix_raw.csv",
@@ -80,6 +83,8 @@ REQUIRED_COMPLETION_ARTIFACTS = (
     "true_vs_pred/true_vs_pred_image_manifest.csv",
     "metadata/run_summary.json",
 )
+
+CURRENT_ARTIFACT_SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -98,7 +103,7 @@ def deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "data": {
-        "dataset_root": "Dataset_classes",
+        "dataset_root": "Dataset_classes_v1",
         "defined_folder": "1 Defined",
         "asset_root": "Generated_Branches",
         "image_size": 224,
@@ -123,6 +128,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "checkpoint_metric": "val_loss",
         "progress_bar": True,
         "progress_update_steps": 1,
+        "epoch_progress_log": True,
+        "epoch_progress_to_stderr": True,
         "stop_on_run_failure": True,
         "class_weights": {
             "enabled": True,
@@ -137,23 +144,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fallback_random_epochs": 35,
     },
     "tfidf": {
-        "max_features": 2048,
+        "max_features": 4000,
         "ngram_min": 1,
         "ngram_max": 2,
         "min_df": 1,
-        "stop_words": "english",
-        "use_svd": False,
-        "svd_components": 256,
+        "stop_words": None,
+        "use_svd": True,
+        "svd_components": 128,
+        "svd_normalize": True,
     },
     "fusion": {
         "mode": "gated",
         "hidden_dim": 512,
-        "aux_hidden_dim": 256,
+        "aux_hidden_dim": 512,
+        "aux_align_dim": 256,
         "dropout": 0.2,
-        "auxiliary_loss_weight": 0.05,
+        "auxiliary_loss_weight": 0.15,
         "separate_branch_backbones": False,
     },
-    "evaluation": {"top_k_samples": 20},
+    "evaluation": {"top_k_samples": 20, "high_loss_top_k_per_epoch": 50},
     "explainability": {
         "splits": ["val"],
         "comparison_samples_per_class": 2,
@@ -223,7 +232,7 @@ def is_complete(run_dir: Path) -> bool:
             return False
     try:
         summary = json.loads((run_dir / "metadata" / "run_summary.json").read_text(encoding="utf-8"))
-        return summary.get("status") == "complete"
+        return summary.get("status") == "complete" and int(summary.get("artifact_schema_version", 0)) >= CURRENT_ARTIFACT_SCHEMA_VERSION
     except Exception:
         return False
 
@@ -237,7 +246,7 @@ class RunnerArgs:
     fusion: str | None = None
     resume: bool = True
     skip_completed: bool = True
-    include_original_only: bool = False
+    include_original_only: bool = True
     dry_run: bool = False
     dataset_root: Path | None = None
     asset_root: Path | None = None
@@ -557,7 +566,8 @@ class ExperimentRunner:
             fusion_mode=str(fusion_cfg.get("mode", "gated")),
             dropout=float(fusion_cfg.get("dropout", 0.2)),
             aux_feature_dim=bundle.aux_feature_dim,
-            aux_hidden_dim=int(fusion_cfg.get("aux_hidden_dim", 256)),
+            aux_hidden_dim=int(fusion_cfg.get("aux_hidden_dim", 512)),
+            aux_align_dim=int(fusion_cfg.get("aux_align_dim", 256)),
             separate_branch_backbones=bool(fusion_cfg.get("separate_branch_backbones", False)),
             pretrained_requested=bool(pretrained_cfg.get("requested", True)),
             allow_random_fallback=bool(pretrained_cfg.get("train_random_init_if_pretrained_fails", True)),
@@ -604,6 +614,8 @@ class ExperimentRunner:
 
         history: list[dict[str, Any]] = []
         cartography_rows: list[dict[str, Any]] = []
+        high_loss_epoch_rows: list[dict[str, Any]] = []
+        high_loss_top_k = int(self.config.get("evaluation", {}).get("high_loss_top_k_per_epoch", 50))
         best_metric = float("inf")
         best_epoch = 0
         patience = configured_patience
@@ -625,7 +637,7 @@ class ExperimentRunner:
             )
             cartography_rows.extend(train_cart)
             print(f"[EPOCH {epoch}/{epochs}] val start: {model_name}/{experiment.name}", flush=True)
-            val_stats, _, _, _, _ = self._evaluate(
+            val_stats, epoch_y_true, epoch_probs, epoch_losses, epoch_payload = self._evaluate(
                 model,
                 val_loader,
                 criterion,
@@ -633,6 +645,18 @@ class ExperimentRunner:
                 collect_embeddings=False,
                 progress_desc=f"{model_name}/{experiment.name} epoch {epoch}/{epochs} val",
             )
+            epoch_prediction_rows = build_prediction_rows(
+                epoch_payload["sample_ids"],
+                epoch_payload["image_paths"],
+                epoch_y_true,
+                epoch_probs,
+                epoch_losses,
+                class_names,
+            )
+            high_loss_epoch_rows.extend(
+                save_epoch_high_loss_samples(run_dir, epoch_prediction_rows, epoch, top_k=high_loss_top_k)
+            )
+            save_csv(run_dir / "high_loss_samples" / "high_loss_epoch_manifest.csv", high_loss_epoch_rows)
             scheduler.step()
             row = {"epoch": epoch, **train_stats, **{f"val_{k}": v for k, v in val_stats.items()}}
             history.append(row)
@@ -655,33 +679,31 @@ class ExperimentRunner:
                 stale += 1
                 if stale >= patience:
                     should_stop = True
-            print(
-                (
-                    f"[EPOCH {epoch}/{epochs}] done: "
-                    f"train_loss={train_stats['train_loss']:.4f} "
-                    f"train_acc={train_stats['train_accuracy']:.4f} "
-                    f"train_f1={train_stats['train_macro_f1']:.4f} "
-                    f"train_precision={train_stats['train_macro_precision']:.4f} "
-                    f"train_recall={train_stats['train_macro_recall']:.4f} "
-                    f"train_top2={train_stats['train_top2_accuracy']:.4f} "
-                    f"train_top3={train_stats['train_top3_accuracy']:.4f} "
-                    f"val_loss={val_stats['loss']:.4f} "
-                    f"val_acc={val_stats['accuracy']:.4f} "
-                    f"val_f1={val_stats['macro_f1']:.4f} "
-                    f"val_precision={val_stats['macro_precision']:.4f} "
-                    f"val_recall={val_stats['macro_recall']:.4f} "
-                    f"val_bal_acc={val_stats['balanced_accuracy']:.4f} "
-                    f"val_top2={val_stats['top2_accuracy']:.4f} "
-                    f"val_top3={val_stats['top3_accuracy']:.4f} "
-                    f"val_aux={val_stats['aux_loss']:.4f} "
-                    f"best_epoch={best_epoch}"
-                ),
-                flush=True,
+            epoch_line = (
+                f"[EPOCH {epoch}/{epochs}] done: "
+                f"train_loss={train_stats['train_loss']:.4f} "
+                f"train_acc={train_stats['train_accuracy']:.4f} "
+                f"train_f1={train_stats['train_macro_f1']:.4f} "
+                f"train_precision={train_stats['train_macro_precision']:.4f} "
+                f"train_recall={train_stats['train_macro_recall']:.4f} "
+                f"train_top2={train_stats['train_top2_accuracy']:.4f} "
+                f"train_top3={train_stats['train_top3_accuracy']:.4f} "
+                f"val_loss={val_stats['loss']:.4f} "
+                f"val_acc={val_stats['accuracy']:.4f} "
+                f"val_f1={val_stats['macro_f1']:.4f} "
+                f"val_precision={val_stats['macro_precision']:.4f} "
+                f"val_recall={val_stats['macro_recall']:.4f} "
+                f"val_bal_acc={val_stats['balanced_accuracy']:.4f} "
+                f"val_top2={val_stats['top2_accuracy']:.4f} "
+                f"val_top3={val_stats['top3_accuracy']:.4f} "
+                f"val_aux={val_stats['aux_loss']:.4f} "
+                f"best_epoch={best_epoch}"
             )
+            self._emit_epoch_progress(run_dir, epoch_line)
             if should_stop:
-                print(
+                self._emit_epoch_progress(
+                    run_dir,
                     f"[EARLY STOP] model={model_name} experiment={experiment.name} epoch={epoch} stale_epochs={stale}",
-                    flush=True,
                 )
                 break
 
@@ -770,8 +792,9 @@ class ExperimentRunner:
             images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
             labels = batch["labels"].to(self.device, non_blocking=True)
             aux = batch["aux_features"].to(self.device, non_blocking=True)
+            aux_mask = batch["aux_mask"].to(self.device, non_blocking=True)
             with autocast_context(enabled=scaler.is_enabled(), device_type=self.device.type):
-                features = model.extract_analysis_features(images, aux)
+                features = model.extract_analysis_features(images, aux, aux_mask)
                 logits = features["logits"]
                 ce = criterion(logits, labels).mean()
                 aux_loss = model.auxiliary_alignment_loss(features) if aux_weight > 0 else logits.new_tensor(0.0)
@@ -898,7 +921,8 @@ class ExperimentRunner:
                 images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
                 labels = batch["labels"].to(self.device, non_blocking=True)
                 aux = batch["aux_features"].to(self.device, non_blocking=True)
-                features = model.extract_analysis_features(images, aux)
+                aux_mask = batch["aux_mask"].to(self.device, non_blocking=True)
+                features = model.extract_analysis_features(images, aux, aux_mask)
                 logits = features["logits"]
                 ce_each = criterion(logits, labels)
                 ce = ce_each.mean()
@@ -924,7 +948,7 @@ class ExperimentRunner:
                 if collect_embeddings:
                     for key, value in features.items():
                         if isinstance(value, torch.Tensor) and (
-                            key.endswith("_embedding") or key.endswith("_projected_embedding") or key in {"fused_visual_embedding", "probabilities", "aux_input"}
+                            key.endswith("_embedding") or key.endswith("_projected_embedding") or key in {"fused_visual_embedding", "probabilities", "aux_input", "aux_mask"}
                         ):
                             embedding_store.setdefault(key, []).append(value.detach().cpu().numpy())
                 if step % update_steps == 0 or step == len(loader):
@@ -997,6 +1021,18 @@ class ExperimentRunner:
     def _set_progress_postfix(progress: Any, values: dict[str, str]) -> None:
         if hasattr(progress, "set_postfix"):
             progress.set_postfix(values, refresh=False)
+
+    def _emit_epoch_progress(self, run_dir: Path, line: str) -> None:
+        print(line, flush=True)
+        train_cfg = self.config.get("training", {})
+        if bool(train_cfg.get("epoch_progress_log", True)):
+            log_path = run_dir / "logs" / "epoch_progress.log"
+            ensure_dir(log_path.parent)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{utc_now()} {line}\n")
+                handle.flush()
+        if bool(train_cfg.get("epoch_progress_to_stderr", True)):
+            print(line, file=sys.stderr, flush=True)
 
     def _write_cartography(self, run_dir: Path, rows: list[dict[str, Any]]) -> None:
         save_csv(run_dir / "cartography" / "training_dynamics.csv", rows)
@@ -1071,11 +1107,12 @@ class ExperimentRunner:
             for batch in loader:
                 images = {branch: tensor.to(self.device, non_blocking=True) for branch, tensor in batch["images"].items()}
                 aux = batch["aux_features"].to(self.device, non_blocking=True)
+                aux_mask = batch["aux_mask"].to(self.device, non_blocking=True)
                 if mode == "zero":
                     aux = torch.zeros_like(aux)
                 elif mode == "shuffle" and aux.shape[0] > 1:
                     aux = aux[torch.randperm(aux.shape[0], device=aux.device)]
-                logits = model(images, aux)
+                logits = model(images, aux, aux_mask)
                 chunks.append(torch.softmax(logits, dim=1).detach().cpu().numpy())
         return np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 0), dtype=np.float32)
 
@@ -1128,6 +1165,7 @@ class ExperimentRunner:
             run_dir / "metadata" / "run_summary.json",
             {
                 "status": "complete",
+                "artifact_schema_version": CURRENT_ARTIFACT_SCHEMA_VERSION,
                 "model": model.backbone_family,
                 "experiment": experiment.name,
                 "branches": list(experiment.branches),

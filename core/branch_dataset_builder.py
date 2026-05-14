@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import math
 from pathlib import Path
 import random
+import sys
 import time
 from typing import Callable
 
@@ -18,10 +19,11 @@ except Exception:  # pragma: no cover - handled at runtime
 
 from .branch_asset_manifest import (
     ImageRecord,
+    crop_box_for_size,
     output_path_for_record,
     scan_defined_dataset,
     summarize_records,
-    validate_image_file,
+    validate_generated_image_file,
 )
 from .experiment_registry import BRANCH_DIRS, CROPPED, SEGMENTED, THERMAL
 from .progress_tracker import CSVProgressTracker, atomic_write_json, ensure_dir
@@ -69,10 +71,7 @@ def _save_image_atomic(image: Image.Image, path: Path) -> None:
 
 def crop_local_image(image: Image.Image) -> Image.Image:
     width, height = image.size
-    top = int(math.floor(0.25 * height))
-    bottom = int(math.ceil(0.70 * height))
-    left = int(math.floor(0.10 * width))
-    right = int(math.ceil(0.90 * width))
+    left, top, right, bottom = crop_box_for_size(width, height)
     top = max(0, min(height - 1, top))
     bottom = max(top + 1, min(height, bottom))
     left = max(0, min(width - 1, left))
@@ -81,16 +80,10 @@ def crop_local_image(image: Image.Image) -> Image.Image:
 
 
 def crop_box_for_image(image: Image.Image) -> tuple[int, int, int, int]:
-    width, height = image.size
-    return (
-        int(math.floor(0.10 * width)),
-        int(math.floor(0.25 * height)),
-        int(math.ceil(0.90 * width)),
-        int(math.ceil(0.70 * height)),
-    )
+    return crop_box_for_size(*image.size)
 
 
-def thermal_clahe_inferno(image: Image.Image) -> Image.Image:
+def thermal_clahe_inferno_full(image: Image.Image) -> Image.Image:
     if cv2 is None:
         raise RuntimeError("OpenCV is required for the CLAHE_Inferno branch")
     rgb = np.array(image.convert("RGB"))
@@ -100,6 +93,12 @@ def thermal_clahe_inferno(image: Image.Image) -> Image.Image:
     colored = cv2.applyColorMap(enhanced, cv2.COLORMAP_INFERNO)
     colored = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
     return Image.fromarray(colored)
+
+
+def thermal_clahe_inferno(image: Image.Image) -> Image.Image:
+    """Apply the CLAHE-Inferno representation to the same local crop window."""
+
+    return thermal_clahe_inferno_full(crop_local_image(image))
 
 
 def _gray_world_normalize_bgr(bgr: np.ndarray) -> np.ndarray:
@@ -358,43 +357,104 @@ def _detect_glare_mask(bgr: np.ndarray, road_mask: np.ndarray) -> np.ndarray:
     return _refine_mask(mask, 3, 11)
 
 
-def segmented_best_combined(image: Image.Image, resize_shape: tuple[int, int] = (960, 720)) -> tuple[Image.Image, list[str]]:
-    """Classical best-combination road-focused representation.
+_ROI_VIS_COMPONENTS: dict[str, object] | None = None
 
-    The original repository modules documented in SEG.md are not present in this
-    workspace, so this implementation preserves the same deterministic classical-CV
-    flow: resize/white-balance, sky and horizon cues, conservative trapezoid road ROI,
-    lane/glare suppression, inpainting, and black non-road suppression. Only this
-    final BEST_COMBINED image is returned for classifier training.
-    """
+
+def _module_is_under(module_name: str, root: Path) -> bool:
+    module = sys.modules.get(module_name)
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        return False
+    try:
+        Path(module_file).resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _load_roi_vis_components() -> dict[str, object]:
+    global _ROI_VIS_COMPONENTS
+    if _ROI_VIS_COMPONENTS is not None:
+        return _ROI_VIS_COMPONENTS
+
+    roi_root = Path(__file__).resolve().parents[1] / "roi_vis"
+    if not roi_root.exists():
+        raise FileNotFoundError(f"roi_vis folder does not exist: {roi_root}")
+    roi_root_str = str(roi_root)
+    if roi_root_str not in sys.path:
+        sys.path.insert(0, roi_root_str)
+
+    # The copied roi_vis code intentionally uses top-level imports such as
+    # `from config import ...`; make sure those names resolve to roi_vis.
+    for module_name in ("config", "pipelines", "methods", "utils", "batch"):
+        if module_name in sys.modules and not _module_is_under(module_name, roi_root):
+            sys.modules.pop(module_name, None)
+
+    try:
+        from config import create_default_config
+        from pipelines import pipeline_best_combination
+        from pipelines.shared_context import build_base_context, ensure_best_context
+        from utils.image_utils import resize_and_normalize
+        from utils.mask_utils import mask_ratio
+    except Exception as exc:  # noqa: BLE001 - report import failures clearly
+        raise RuntimeError(f"Could not import roi_vis segmentation pipeline from {roi_root}: {exc}") from exc
+
+    _ROI_VIS_COMPONENTS = {
+        "create_default_config": create_default_config,
+        "pipeline_best_combination": pipeline_best_combination,
+        "build_base_context": build_base_context,
+        "ensure_best_context": ensure_best_context,
+        "resize_and_normalize": resize_and_normalize,
+        "mask_ratio": mask_ratio,
+    }
+    return _ROI_VIS_COMPONENTS
+
+
+def _roi_vis_warning_list(ctx: object, mask_ratio: Callable[..., float]) -> list[str]:
+    warnings: list[str] = []
+    if mask_ratio(ctx.sky_mask) < 0.01:
+        warnings.append("low_sky_mask")
+    if mask_ratio(ctx.road_mask) < 0.04:
+        warnings.append("low_road_mask")
+    if mask_ratio(ctx.road_mask) > 0.80:
+        warnings.append("large_road_mask")
+    if mask_ratio(ctx.lane_mask, ctx.road_mask) < 0.0005:
+        warnings.append("sparse_lane_mask")
+    if mask_ratio(ctx.glare_mask, ctx.road_mask) > 0.08:
+        warnings.append("large_glare_mask")
+    if mask_ratio(ctx.snow_refined, ctx.road_mask) > 0.92:
+        warnings.append("very_large_snow_mask")
+    return warnings
+
+
+def segmented_best_combined(image: Image.Image, resize_shape: tuple[int, int] = (960, 720)) -> tuple[Image.Image, list[str]]:
+    """Run the copied roi_vis BEST_COMBINATION pipeline for segmentation."""
 
     if cv2 is None:
         raise RuntimeError("OpenCV is required for segmented_best_combined")
-    warnings: list[str] = []
+    components = _load_roi_vis_components()
+    create_default_config = components["create_default_config"]
+    pipeline_best_combination = components["pipeline_best_combination"]
+    build_base_context = components["build_base_context"]
+    ensure_best_context = components["ensure_best_context"]
+    resize_and_normalize = components["resize_and_normalize"]
+    mask_ratio = components["mask_ratio"]
+
+    cfg = create_default_config()
+    cfg.resize_width, cfg.resize_height = resize_shape
     rgb = np.array(image.convert("RGB"))
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    bgr = cv2.resize(bgr, resize_shape, interpolation=cv2.INTER_AREA)
-    bgr = _gray_world_normalize_bgr(bgr)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    horizon = _estimate_horizon(gray)
-    sky = _detect_sky_mask(bgr, gray, horizon)
-    vp = _estimate_vanishing_point(gray, horizon)
-    trapezoid = _road_trapezoid(gray.shape, horizon, vp)
-    road = _detect_road_mask(bgr, gray, sky, trapezoid)
-    road_ratio = float((road > 0).mean())
-    if road_ratio < 0.04:
-        warnings.append(f"small_road_roi:{road_ratio:.4f}")
-    if road_ratio > 0.85:
-        warnings.append(f"large_road_roi:{road_ratio:.4f}")
-    lane = _detect_lane_mask(bgr, road)
-    glare = _detect_glare_mask(bgr, road)
-    inpaint_mask = cv2.bitwise_or(lane, glare)
-    cleaned = bgr.copy()
-    if np.any(inpaint_mask > 0):
-        cleaned = cv2.inpaint(cleaned, inpaint_mask, 3, cv2.INPAINT_TELEA)
-    best = np.zeros_like(cleaned)
-    best[road > 0] = cleaned[road > 0]
-    best_rgb = cv2.cvtColor(best, cv2.COLOR_BGR2RGB)
+    working = resize_and_normalize(bgr, cfg.resize_shape)
+    result, ctx = pipeline_best_combination.run_pipeline(working, cfg, None)
+    best = next((artifact.data for artifact in result.artifacts if artifact.key == "best_combined"), None)
+    if best is None:
+        ctx = ensure_best_context(build_base_context(working, cfg, ctx), cfg)
+        best = ctx.best_image
+    warnings = _roi_vis_warning_list(ctx, mask_ratio)
+    if best.ndim == 2:
+        best_rgb = cv2.cvtColor(best, cv2.COLOR_GRAY2RGB)
+    else:
+        best_rgb = cv2.cvtColor(best, cv2.COLOR_BGR2RGB)
     return Image.fromarray(best_rgb), warnings
 
 
@@ -522,7 +582,7 @@ class BranchDatasetBuilder:
         for record in records:
             output_path = output_path_for_record(branch_root, record, branch)
             key = record.sample_id
-            if not overwrite and skip_completed and validate_image_file(output_path)[0]:
+            if not overwrite and skip_completed and validate_generated_image_file(output_path, record, branch)[0]:
                 stats["skipped"] += 1
                 continue
             start = time.perf_counter()
@@ -537,7 +597,7 @@ class BranchDatasetBuilder:
                 else:
                     out_image = result
                 _save_image_atomic(out_image.convert("RGB"), output_path)
-                valid, message, _, _ = validate_image_file(output_path)
+                valid, message, _, _ = validate_generated_image_file(output_path, record, branch)
                 if not valid:
                     raise RuntimeError(f"written image failed validation: {message}")
                 if warnings:
@@ -576,7 +636,7 @@ class BranchDatasetBuilder:
         ok = missing = corrupt = 0
         for record in records:
             output_path = output_path_for_record(branch_root, record, branch)
-            valid, message, size, mode = validate_image_file(output_path)
+            valid, message, size, mode = validate_generated_image_file(output_path, record, branch)
             if valid:
                 ok += 1
             elif message == "missing":

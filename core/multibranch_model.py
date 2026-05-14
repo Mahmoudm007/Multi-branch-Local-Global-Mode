@@ -112,7 +112,8 @@ class FiveBranchExperimentModel(nn.Module):
         fusion_mode: str = "gated",
         dropout: float = 0.2,
         aux_feature_dim: int = 0,
-        aux_hidden_dim: int = 256,
+        aux_hidden_dim: int = 512,
+        aux_align_dim: int = 256,
         separate_branch_backbones: bool = False,
         pretrained_requested: bool = True,
         allow_random_fallback: bool = True,
@@ -124,6 +125,7 @@ class FiveBranchExperimentModel(nn.Module):
         self.num_classes = num_classes
         self.hidden_dim = hidden_dim
         self.aux_feature_dim = aux_feature_dim
+        self.aux_align_dim = aux_align_dim
         self.separate_branch_backbones = separate_branch_backbones
 
         build = build_timm_backbone(backbone_family, pretrained_requested, allow_random_fallback, allow_remote_download)
@@ -164,6 +166,8 @@ class FiveBranchExperimentModel(nn.Module):
             nn.Linear(hidden_dim, num_classes),
         )
         self.aux_encoder: nn.Module | None = None
+        self.image_align_head: nn.Module | None = None
+        self.aux_align_head: nn.Module | None = None
         if experiment.uses_aux_text and aux_feature_dim > 0:
             self.aux_encoder = nn.Sequential(
                 nn.LayerNorm(aux_feature_dim),
@@ -172,6 +176,16 @@ class FiveBranchExperimentModel(nn.Module):
                 nn.Dropout(dropout),
                 nn.Linear(aux_hidden_dim, hidden_dim),
                 nn.GELU(),
+            )
+            self.image_align_head = nn.Sequential(
+                nn.Linear(hidden_dim, aux_align_dim),
+                nn.GELU(),
+                nn.Linear(aux_align_dim, aux_align_dim),
+            )
+            self.aux_align_head = nn.Sequential(
+                nn.Linear(hidden_dim, aux_align_dim),
+                nn.GELU(),
+                nn.Linear(aux_align_dim, aux_align_dim),
             )
 
     def _encode_raw(self, branch: str, images: torch.Tensor) -> torch.Tensor:
@@ -192,6 +206,7 @@ class FiveBranchExperimentModel(nn.Module):
         self,
         images: dict[str, torch.Tensor],
         aux_features: torch.Tensor | None = None,
+        aux_mask: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         raw: dict[str, torch.Tensor] = {}
         projected: dict[str, torch.Tensor] = {}
@@ -213,20 +228,40 @@ class FiveBranchExperimentModel(nn.Module):
         if self.aux_encoder is not None and aux_features is not None and aux_features.numel() > 0:
             features["aux_embedding"] = self.aux_encoder(aux_features)
             features["aux_input"] = aux_features
+            if aux_mask is None:
+                aux_mask = torch.ones(aux_features.shape[0], device=aux_features.device, dtype=aux_features.dtype)
+            features["aux_mask"] = aux_mask.to(device=aux_features.device, dtype=aux_features.dtype).view(-1)
         return features
 
-    def forward(self, images: dict[str, torch.Tensor], aux_features: torch.Tensor | None = None) -> torch.Tensor:
-        return self.extract_analysis_features(images, aux_features)["logits"]
+    def forward(
+        self,
+        images: dict[str, torch.Tensor],
+        aux_features: torch.Tensor | None = None,
+        aux_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.extract_analysis_features(images, aux_features, aux_mask)["logits"]
 
-    @staticmethod
-    def auxiliary_alignment_loss(features: dict[str, Any]) -> torch.Tensor:
+    def auxiliary_alignment_loss(self, features: dict[str, Any]) -> torch.Tensor:
         visual = features.get("fused_visual_embedding")
         aux = features.get("aux_embedding")
         if not isinstance(visual, torch.Tensor) or not isinstance(aux, torch.Tensor):
             if isinstance(visual, torch.Tensor):
                 return visual.new_tensor(0.0)
             return torch.tensor(0.0)
-        return (1.0 - F.cosine_similarity(F.normalize(visual, dim=1), F.normalize(aux, dim=1), dim=1)).mean()
+        aux_mask = features.get("aux_mask")
+        if isinstance(aux_mask, torch.Tensor):
+            valid = aux_mask.to(device=visual.device).view(-1) > 0.5
+        else:
+            valid = torch.ones(visual.shape[0], device=visual.device, dtype=torch.bool)
+        if not bool(valid.any()):
+            return visual.new_tensor(0.0)
+        if self.image_align_head is not None and self.aux_align_head is not None:
+            image_embedding = F.normalize(self.image_align_head(visual[valid]), dim=1)
+            aux_embedding = F.normalize(self.aux_align_head(aux[valid]), dim=1)
+        else:
+            image_embedding = F.normalize(visual[valid], dim=1)
+            aux_embedding = F.normalize(aux[valid], dim=1)
+        return 1.0 - (image_embedding * aux_embedding).sum(dim=1).mean()
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -240,6 +275,7 @@ class FiveBranchExperimentModel(nn.Module):
             "visual_branches": list(self.experiment.visual_branches),
             "uses_aux_text": self.experiment.uses_aux_text,
             "aux_feature_dim": self.aux_feature_dim,
+            "aux_align_dim": self.aux_align_dim,
             "separate_branch_backbones": self.separate_branch_backbones,
             "shared_backbone": not self.separate_branch_backbones,
             "logits_are_image_driven": True,

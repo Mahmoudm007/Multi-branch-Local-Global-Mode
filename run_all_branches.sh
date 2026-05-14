@@ -46,12 +46,14 @@ export TIMM_HOME="$CLB_PRETRAINED_CACHE_DIR/timm"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 
 CONFIG_PATH="${CONFIG_PATH:-configs/multibranch_default.yaml}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-Output_v2}"
 
-mkdir -p weights "$HF_HUB_CACHE" "$TORCH_HOME" "$TIMM_HOME" "$TRANSFORMERS_CACHE" Output/_global_comparison_per_combination
+mkdir -p weights "$HF_HUB_CACHE" "$TORCH_HOME" "$TIMM_HOME" "$TRANSFORMERS_CACHE" "$OUTPUT_ROOT/_global_comparison_per_combination"
 
 echo "Host: $(hostname)"
 echo "Working dir: $(pwd)"
 echo "Config: $CONFIG_PATH"
+echo "Output root: $OUTPUT_ROOT"
 echo "Python: $(which python)"
 nvidia-smi -L || true
 python - <<'PY'

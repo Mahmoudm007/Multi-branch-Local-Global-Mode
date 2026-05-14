@@ -184,6 +184,19 @@ def save_predictions(
     losses: np.ndarray,
     class_names: list[str],
 ) -> list[dict[str, Any]]:
+    rows = build_prediction_rows(sample_ids, image_paths, y_true, probs, losses, class_names)
+    save_csv(run_dir / "predictions" / "predictions.csv", rows)
+    return rows
+
+
+def build_prediction_rows(
+    sample_ids: list[str],
+    image_paths: list[str],
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    losses: np.ndarray,
+    class_names: list[str],
+) -> list[dict[str, Any]]:
     y_pred = probs.argmax(axis=1)
     rows: list[dict[str, Any]] = []
     for i, sample_id in enumerate(sample_ids):
@@ -202,7 +215,6 @@ def save_predictions(
         for cls_idx, cls_name in enumerate(class_names):
             row[f"prob_{cls_name.replace(' ', '_')}"] = float(probs[i, cls_idx])
         rows.append(row)
-    save_csv(run_dir / "predictions" / "predictions.csv", rows)
     return rows
 
 
@@ -321,35 +333,65 @@ def unnormalize_tensor(image: torch.Tensor) -> np.ndarray:
 def save_sample_panels(run_dir: Path, prediction_rows: list[dict[str, Any]], max_samples: int = 20) -> None:
     hardest = sorted(prediction_rows, key=lambda row: float(row["loss"]), reverse=True)[:max_samples]
     confident = sorted(prediction_rows, key=lambda row: float(row["confidence"]), reverse=True)[:max_samples]
-    _write_true_vs_pred_individuals(prediction_rows, run_dir / "true_vs_pred" / "images")
+    _write_true_vs_pred_individuals(prediction_rows, run_dir / "true_vs_pred")
     _write_prediction_grid(hardest, run_dir / "high_loss_samples" / "high_loss_samples.png", "High-loss samples")
     _write_prediction_grid(confident, run_dir / "true_vs_pred" / "true_vs_pred_samples.png", "True vs predicted samples")
 
 
-def _write_true_vs_pred_individuals(rows: list[dict[str, Any]], output_dir: Path) -> None:
-    ensure_dir(output_dir)
+def save_epoch_high_loss_samples(
+    run_dir: Path,
+    prediction_rows: list[dict[str, Any]],
+    epoch: int,
+    top_k: int = 50,
+) -> list[dict[str, Any]]:
+    top_rows = sorted(prediction_rows, key=lambda row: float(row["loss"]), reverse=True)[: max(0, top_k)]
+    epoch_dir = ensure_dir(run_dir / "high_loss_samples" / f"epoch_{epoch:03d}")
     used_names: set[str] = set()
     manifest_rows: list[dict[str, Any]] = []
-    font = ImageFont.load_default()
+    for rank, row in enumerate(top_rows, start=1):
+        source_path = Path(str(row["image_path"]))
+        output_name = _ranked_prediction_filename(rank, source_path, used_names)
+        output_path = epoch_dir / output_name
+        caption = (
+            f"epoch={epoch} | rank={rank} | true={row['true_label']} | pred={row['pred_label']} | "
+            f"confidence={float(row['confidence']):.3f} | loss={float(row['loss']):.4f} | correct={row['correct']}"
+        )
+        _write_captioned_prediction_image(source_path, output_path, caption)
+        manifest_rows.append(
+            {
+                "epoch": epoch,
+                "rank": rank,
+                "sample_id": row["sample_id"],
+                "source_image": source_path.name,
+                "true_label": row["true_label"],
+                "pred_label": row["pred_label"],
+                "confidence": row["confidence"],
+                "loss": row["loss"],
+                "correct": row["correct"],
+                "output_path": str(output_path),
+            }
+        )
+    save_csv(epoch_dir / "high_loss_manifest.csv", manifest_rows)
+    _write_prediction_grid(top_rows, epoch_dir / "high_loss_grid.png", f"Epoch {epoch} high-loss samples")
+    return manifest_rows
+
+
+def _write_true_vs_pred_individuals(rows: list[dict[str, Any]], output_root: Path) -> None:
+    ensure_dir(output_root)
+    used_names_by_label: dict[str, set[str]] = {}
+    manifest_rows: list[dict[str, Any]] = []
     for row in rows:
         source_path = Path(str(row["image_path"]))
+        label_folder = _safe_label_folder(str(row["true_label"]))
+        class_dir = ensure_dir(output_root / label_folder)
+        used_names = used_names_by_label.setdefault(label_folder, set())
         output_name = _unique_panel_filename(source_path, used_names)
-        output_path = output_dir / output_name
-        try:
-            image = ImageOps.contain(Image.open(source_path).convert("RGB"), (640, 420))
-        except Exception:
-            image = Image.new("RGB", (640, 420), "black")
+        output_path = class_dir / output_name
         caption = (
             f"true={row['true_label']} | pred={row['pred_label']} | "
-            f"confidence={float(row['confidence']):.3f} | correct={row['correct']}"
+            f"confidence={float(row['confidence']):.3f} | loss={float(row['loss']):.4f} | correct={row['correct']}"
         )
-        lines = _wrap_caption(caption, width=104, max_lines=3)
-        caption_h = max(62, 16 * len(lines) + 18)
-        canvas = Image.new("RGB", (image.width, image.height + caption_h), "white")
-        canvas.paste(image, (0, 0))
-        draw = ImageDraw.Draw(canvas)
-        draw.multiline_text((8, image.height + 10), "\n".join(lines), fill=(0, 0, 0), font=font, spacing=3)
-        canvas.save(output_path)
+        _write_captioned_prediction_image(source_path, output_path, caption)
         manifest_rows.append(
             {
                 "sample_id": row["sample_id"],
@@ -357,10 +399,50 @@ def _write_true_vs_pred_individuals(rows: list[dict[str, Any]], output_dir: Path
                 "true_label": row["true_label"],
                 "pred_label": row["pred_label"],
                 "confidence": row["confidence"],
+                "loss": row["loss"],
+                "correct": row["correct"],
                 "output_path": str(output_path),
             }
         )
-    save_csv(output_dir.parent / "true_vs_pred_image_manifest.csv", manifest_rows)
+    save_csv(output_root / "true_vs_pred_image_manifest.csv", manifest_rows)
+
+
+def _write_captioned_prediction_image(source_path: Path, output_path: Path, caption: str) -> None:
+    ensure_dir(output_path.parent)
+    font = ImageFont.load_default()
+    try:
+        image = ImageOps.contain(Image.open(source_path).convert("RGB"), (640, 420))
+    except Exception:
+        image = Image.new("RGB", (640, 420), "black")
+    lines = _wrap_caption(caption, width=104, max_lines=3)
+    caption_h = max(62, 16 * len(lines) + 18)
+    canvas = Image.new("RGB", (image.width, image.height + caption_h), "white")
+    canvas.paste(image, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.multiline_text((8, image.height + 10), "\n".join(lines), fill=(0, 0, 0), font=font, spacing=3)
+    canvas.save(output_path)
+
+
+def _ranked_prediction_filename(rank: int, source_path: Path, used_names: set[str]) -> str:
+    stem = _safe_filename_stem(source_path)
+    filename = f"rank_{rank:03d}_{stem}.png"
+    if filename not in used_names:
+        used_names.add(filename)
+        return filename
+    counter = 1
+    while True:
+        candidate = f"rank_{rank:03d}_{stem}_{counter}.png"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        counter += 1
+
+
+def _safe_label_folder(label: str) -> str:
+    normalized = str(label).strip().replace("_", " ").replace("-", " ")
+    normalized = " ".join(normalized.split())
+    safe = "".join(char if char.isalnum() or char in {" ", "-", "_"} else "_" for char in normalized)
+    return safe.strip(" ._") or "unknown"
 
 
 def _write_prediction_grid(rows: list[dict[str, Any]], path: Path, title: str) -> None:
@@ -435,8 +517,9 @@ def save_grad_saliency_panels(
         first_branch = next(iter(images))
         images[first_branch] = images[first_branch].detach().clone().requires_grad_(True)
         aux = batch["aux_features"].to(device)
+        aux_mask = batch["aux_mask"].to(device)
         model.zero_grad(set_to_none=True)
-        logits = model(images, aux)
+        logits = model(images, aux, aux_mask)
         probs = torch.softmax(logits, dim=1)
         preds = probs.argmax(dim=1)
         selected_scores = logits.gather(1, preds.view(-1, 1)).sum()
@@ -570,10 +653,11 @@ def save_patch_occlusion_and_faithfulness(
     for batch in loader:
         images = {branch: tensor.to(device) for branch, tensor in batch["images"].items()}
         aux = batch["aux_features"].to(device)
+        aux_mask = batch["aux_mask"].to(device)
         labels = batch["labels"].to(device)
         branch = next(iter(images))
         with torch.no_grad():
-            logits = model(images, aux)
+            logits = model(images, aux, aux_mask)
             probs = torch.softmax(logits, dim=1)
             preds = probs.argmax(dim=1)
         for idx in range(labels.shape[0]):
@@ -596,7 +680,7 @@ def save_patch_occlusion_and_faithfulness(
                     x1 = width if gx == grid_size - 1 else (gx + 1) * patch_w
                     masked_images[branch][:, :, y0:y1, x0:x1] = 0.0
                     with torch.no_grad():
-                        masked_prob = torch.softmax(model(masked_images, aux[idx : idx + 1]), dim=1)[0, target].item()
+                        masked_prob = torch.softmax(model(masked_images, aux[idx : idx + 1], aux_mask[idx : idx + 1]), dim=1)[0, target].item()
                     drop = base_prob - float(masked_prob)
                     drops[gy, gx] = drop
                     patch_scores.append((drop, gy, gx))
@@ -621,7 +705,7 @@ def save_patch_occlusion_and_faithfulness(
                 x1 = width if gx == grid_size - 1 else (gx + 1) * patch_w
                 deletion_images[branch][:, :, y0:y1, x0:x1] = 0.0
                 with torch.no_grad():
-                    deletion_prob = torch.softmax(model(deletion_images, aux[idx : idx + 1]), dim=1)[0, target].item()
+                    deletion_prob = torch.softmax(model(deletion_images, aux[idx : idx + 1], aux_mask[idx : idx + 1]), dim=1)[0, target].item()
                 faithfulness_rows.append(
                     {
                         "sample_id": batch["sample_ids"][idx],

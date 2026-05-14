@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sequential benchmark launcher for SDRE.
-#SBATCH --job-name=TrainingAllModels
+#SBATCH --job-name=Multi-branch Local-Global
 #SBATCH --partition=gpu-h200
 #SBATCH --gres=gpu:8
 #SBATCH --qos=normal
@@ -11,7 +11,7 @@
 #SBATCH --ntasks=1
 #SBATCH --time=4-23:00:00
 #SBATCH --output=outputs/%x-%j.out
-#SBATCH --error=errors/%x-%j.txt
+#SBATCH --error=errors/%x-%j.err
 
 set -euo pipefail
 
@@ -47,12 +47,18 @@ export TIMM_HOME="$CLB_PRETRAINED_CACHE_DIR/timm"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
 
 CONFIG_PATH="${CONFIG_PATH:-configs/multibranch_default.yaml}"
+MODEL="${MODEL:-}"
+EXPERIMENT="${EXPERIMENT:-}"
+INCLUDE_ORIGINAL_ONLY="${INCLUDE_ORIGINAL_ONLY:-true}"
 
 mkdir -p weights "$HF_HUB_CACHE" "$TORCH_HOME" "$TIMM_HOME" "$TRANSFORMERS_CACHE" Output/_global_comparison_per_combination
 
 echo "Host: $(hostname)"
 echo "Working dir: $(pwd)"
 echo "Config: $CONFIG_PATH"
+echo "Model filter: ${MODEL:-all}"
+echo "Experiment filter: ${EXPERIMENT:-all}"
+echo "Include original-only baseline: $INCLUDE_ORIGINAL_ONLY"
 echo "Python: $(which python)"
 nvidia-smi -L || true
 python - <<'PY'
@@ -64,5 +70,19 @@ if torch.cuda.is_available():
     print("cuda_device_0:", torch.cuda.get_device_name(0))
 PY
 
-python -u run_training_exp.py --config configs/multibranch_default.yaml --skip-completed true
+PY_ARGS=(--config "$CONFIG_PATH" --skip-completed true)
+if [[ -n "$MODEL" ]]; then
+  PY_ARGS+=(--model "$MODEL")
+fi
+if [[ -n "$EXPERIMENT" ]]; then
+  PY_ARGS+=(--experiment "$EXPERIMENT")
+fi
+if [[ "$INCLUDE_ORIGINAL_ONLY" =~ ^(1|true|yes|y|on)$ ]]; then
+  PY_ARGS+=(--include-original-only)
+else
+  PY_ARGS+=(--exclude-original-only)
+fi
+
+python -u run_training_exp.py --config configs/multibranch_default.yaml --model convnext
+
  

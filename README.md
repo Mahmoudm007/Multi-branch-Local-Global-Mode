@@ -39,9 +39,9 @@ Branch definitions:
 
 - `original`: source RGB image only.
 - `cropped`: deterministic local crop keeping rows `floor(0.25H):ceil(0.70H)` and columns `floor(0.10W):ceil(0.90W)`.
-- `thermal`: exact `CLAHE_Inferno` transform from `CLACH.md`: RGB to grayscale, OpenCV CLAHE `clipLimit=2.0`, `tileGridSize=(8,8)`, Inferno colormap, BGR back to RGB.
-- `segmented`: deterministic classical CV best-combination branch. Only the final `BEST_COMBINED` road-focused image is saved as classifier input.
-- `auxiliary_text`: fixed class descriptions from `class_descriptions.py`, encoded with TF-IDF and used only for auxiliary alignment/diagnostics. Final logits remain image-driven.
+- `thermal`: the same deterministic local crop as `cropped`, followed by the `CLAHE_Inferno` transform from `CLACH.md`: RGB to grayscale, OpenCV CLAHE `clipLimit=2.0`, `tileGridSize=(8,8)`, Inferno colormap, BGR back to RGB.
+- `segmented`: the copied `roi_vis` best-combination classical CV pipeline. Only the final `BEST_COMBINED` road-focused image is saved as classifier input.
+- `auxiliary_text`: fixed class descriptions from `class_descriptions.py`, encoded with the auxiliary TF-IDF/SVD context pipeline and used only for auxiliary alignment/diagnostics. Final logits remain image-driven.
 
 ## Generate Branch Assets
 
@@ -73,13 +73,14 @@ Useful outputs:
 - `Generated_Branches/previews/*_preview.png`
 - `Generated_Branches/previews/cropped_local_*_crop_audit.png`
 
-During training, any remaining missing or corrupt generated branch assets are filtered out of that run instead of crashing the full benchmark. The exclusion details are written per run to `Output/<model>/<experiment>/metadata/asset_exclusions.csv` and summarized in `asset_filter_summary.json`; training still fails if filtering would leave the train or validation split empty.
+During training, any remaining missing or corrupt generated branch assets are filtered out of that run instead of crashing the full benchmark. The exclusion details are written per run to `Output_v2/<model>/<experiment>/metadata/asset_exclusions.csv` and summarized in `asset_filter_summary.json`; training still fails if filtering would leave the train or validation split empty.
 
 ## Experiment Registry
 
-Default experiments are the 15 required combinations:
+Default experiments are the original-only baseline followed by the required branch combinations:
 
 ```text
+exp_original_only
 exp_original_thermal_segmented_cropped_auxtext
 exp_original_thermal_cropped_auxtext
 exp_original_thermal
@@ -97,12 +98,6 @@ exp_original_thermal_segmented_auxtext
 exp_original_segmented_cropped_auxtext
 ```
 
-Optional non-default baseline:
-
-```text
-exp_original_only
-```
-
 Model families run in this order:
 
 ```text
@@ -113,7 +108,7 @@ xception, beit_base, pvt_v2, mambaout, coatnet, focalnet, davit
 Unavailable local timm backbones are logged in:
 
 ```text
-Output/_global_comparison_per_combination/metadata/model_capability_manifest.json
+Output_v2/_global_comparison_per_combination/metadata/model_capability_manifest.json
 ```
 
 ## Run Training
@@ -128,6 +123,12 @@ Single model across all default experiments:
 
 ```bash
 python run_training_exp.py --model convnext
+```
+
+Exclude the original-only baseline:
+
+```bash
+python run_training_exp.py --exclude-original-only
 ```
 
 Single experiment across all models:
@@ -167,7 +168,7 @@ python run_training_exp.py --model convnext --experiment exp_original_cropped --
 Each run writes:
 
 ```text
-Output/<ModelName>/<ExperimentName>/
+Output_v2/<ModelName>/<ExperimentName>/
   checkpoints/
   logs/
   reports/
@@ -190,7 +191,18 @@ Output/<ModelName>/<ExperimentName>/
     Fully/<original_image_stem>.png
     heatmap_panels/gradcam_heatmap_panels.png
   true_vs_pred/
+    bare/
+    centre partly/
+    two track partly/
+    one track partly/
+    fully/
+    true_vs_pred_image_manifest.csv
   high_loss_samples/
+    epoch_001/
+      high_loss_manifest.csv
+      rank_001_<original_image_stem>.png
+      ...
+    high_loss_epoch_manifest.csv
   comparison_samples/
   predictions/
   metadata/
@@ -208,11 +220,15 @@ Output/<ModelName>/<ExperimentName>/
   data_attribution/
 ```
 
+Completed-epoch progress is also appended in real time to `logs/epoch_progress.log` and mirrored to stderr when `training.epoch_progress_to_stderr` is enabled.
+After each validation epoch, the top 50 highest-loss validation images are written under `high_loss_samples/epoch_###/` with true label, predicted label, confidence, and loss in the image caption and manifest. Final true-vs-pred images are grouped under `true_vs_pred/<true_label>/`.
+
 Completion requires all of these artifacts:
 
 - `checkpoints/best.pt`
 - `checkpoints/last.pt`
 - `logs/history.csv`
+- `high_loss_samples/high_loss_epoch_manifest.csv`
 - `metrics/metrics.json`
 - `predictions/predictions.csv`
 - raw and normalized confusion matrices
@@ -224,13 +240,13 @@ Completion requires all of these artifacts:
 Per-model comparisons are written under:
 
 ```text
-Output/<ModelName>/_comparison_across_experiments/
+Output_v2/<ModelName>/_comparison_across_experiments/
 ```
 
 Global per-experiment comparisons are written under:
 
 ```text
-Output/_global_comparison_per_combination/<ExperimentName>/
+Output_v2/_global_comparison_per_combination/<ExperimentName>/
 ```
 
 ## Notes

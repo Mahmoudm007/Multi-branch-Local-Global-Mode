@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     experiments = [spec.name for spec in build_experiments(include_original_only=True)]
     parser = argparse.ArgumentParser(description="Run the five-branch winter road benchmark sequentially.")
     parser.add_argument("--config", default="configs/multibranch_default.yaml", help="YAML config path.")
-    parser.add_argument("--output-root", default="Output", help="Benchmark output root.")
+    parser.add_argument("--output-root", default="Output_v2", help="Benchmark output root.")
     parser.add_argument("--dataset-root", default=None, help="Override supervised dataset root.")
     parser.add_argument("--asset-root", default=None, help="Override generated branch asset root.")
     parser.add_argument("--defined-folder", default=None, help="Override defined dataset folder.")
@@ -34,7 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument("--skip-completed", nargs="?", const=True, type=parse_bool, default=True, help="Skip robustly completed runs.")
     parser.add_argument("--no-skip-completed", dest="skip_completed", action="store_false")
-    parser.add_argument("--include-original-only", action="store_true", help="Include optional exp_original_only baseline.")
+    parser.add_argument(
+        "--include-original-only",
+        action="store_true",
+        default=True,
+        help="Include exp_original_only baseline. Enabled by default.",
+    )
+    parser.add_argument("--exclude-original-only", dest="include_original_only", action="store_false")
     parser.add_argument("--dry-run", action="store_true", help="Write the planned run manifest without training.")
     parser.add_argument("--device", default=None, help="Override device: auto, cpu, cuda.")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size.")

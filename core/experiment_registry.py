@@ -125,6 +125,8 @@ def experiment_name(branches: Iterable[str]) -> str:
 
 def build_experiments(include_original_only: bool = False) -> list[ExperimentSpec]:
     experiments: list[ExperimentSpec] = []
+    if include_original_only:
+        experiments.append(ExperimentSpec("exp_original_only", (ORIGINAL,)))
     priority_optionals = (
         (THERMAL, SEGMENTED, CROPPED, AUX_TEXT),
         (THERMAL, CROPPED, AUX_TEXT),
@@ -140,8 +142,6 @@ def build_experiments(include_original_only: bool = False) -> list[ExperimentSpe
                 continue
             branches = (ORIGINAL, *optional)
             experiments.append(ExperimentSpec(experiment_name(branches), branches))
-    if include_original_only:
-        experiments.append(ExperimentSpec("exp_original_only", (ORIGINAL,)))
     return experiments
 
 

@@ -11,7 +11,7 @@ from PIL import Image, ImageOps
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from .branch_asset_manifest import ImageRecord, output_path_for_record, scan_defined_dataset, validate_image_file
+from .branch_asset_manifest import ImageRecord, output_path_for_record, scan_defined_dataset, validate_generated_image_file
 from .experiment_registry import (
     AUX_TEXT,
     BRANCH_DIRS,
@@ -95,8 +95,10 @@ class MultiBranchRoadDataset(Dataset):
         }
         if self.experiment.uses_aux_text and self.class_description_matrix is not None:
             item["aux_features"] = torch.from_numpy(self.class_description_matrix[record.label].astype(np.float32, copy=False))
+            item["aux_mask"] = torch.tensor(1.0, dtype=torch.float32)
         else:
             item["aux_features"] = torch.zeros(0, dtype=torch.float32)
+            item["aux_mask"] = torch.tensor(0.0, dtype=torch.float32)
         return item
 
 
@@ -105,10 +107,12 @@ def collate_multibranch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     branch_names = batch[0]["images"].keys()
     images = {branch: torch.stack([item["images"][branch] for item in batch]) for branch in branch_names}
     aux = torch.stack([item["aux_features"] for item in batch])
+    aux_mask = torch.stack([item["aux_mask"] for item in batch])
     return {
         "images": images,
         "labels": labels,
         "aux_features": aux,
+        "aux_mask": aux_mask,
         "sample_ids": [item["sample_id"] for item in batch],
         "image_paths": [item["image_path"] for item in batch],
         "relative_paths": [item["relative_path"] for item in batch],
@@ -150,7 +154,7 @@ def validate_experiment_assets(
         branch_root = asset_root / BRANCH_DIRS[branch] / defined_folder
         for record in records:
             path = output_path_for_record(branch_root, record, branch)
-            valid, message, _, _ = validate_image_file(path)
+            valid, message, _, _ = validate_generated_image_file(path, record, branch)
             if not valid:
                 errors.append(f"{branch}:{record.sample_id}:{message}")
                 if len(errors) >= 25:
@@ -190,7 +194,7 @@ def filter_records_for_available_assets(
         for branch in generated_branches:
             branch_root = asset_root / BRANCH_DIRS[branch] / defined_folder
             path = output_path_for_record(branch_root, record, branch)
-            valid, message, size, mode = validate_image_file(path)
+            valid, message, size, mode = validate_generated_image_file(path, record, branch)
             if valid:
                 continue
             record_ok = False

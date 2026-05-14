@@ -26,6 +26,7 @@ branches:
     safe_logits: image_driven_only
 
 default_experiments:
+  - exp_original_only
   - exp_original_thermal_segmented_cropped_auxtext
   - exp_original_thermal_cropped_auxtext
   - exp_original_thermal
@@ -42,5 +43,4 @@ default_experiments:
   - exp_original_thermal_segmented_auxtext
   - exp_original_segmented_cropped_auxtext
 
-optional_experiments:
-  - exp_original_only
+optional_experiments: []
